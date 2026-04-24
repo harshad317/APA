@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "apa"
+version = "0.1.0"
+description = "Adaptive Prompt Automaton benchmark framework"
+readme = "README.md"
+requires-python = ">=3.10,<3.15"
+authors = [{ name = "Harshad" }]
+dependencies = [
+  "dspy>=3.0.4,<3.2.0",
+  "gepa>=0.0.17,<0.1.0",
+  "datasets>=3.6.0",
+  "typer>=0.12.3",
+  "rich>=13.7.1",
+  "tqdm>=4.66.4",
+]
+
+[project.optional-dependencies]
+retrieval = [
+  "bm25s==0.2.12",
+  "pystemmer==2.2.0.3",
+  "diskcache>=5.6.3",
+  "ujson>=5.10.0",
+]
+ifbench = [
+  "nltk>=3.9",
+  "immutabledict>=4.2.1",
+  "langdetect>=1.0.9",
+  "packaging>=24.1",
+  "spacy>=3.7.5",
+  "emoji>=2.12.1",
+  "syllapy>=0.7.2",
+]
+livebench_math = [
+  "sympy>=1.13.2",
+  "lark>=1.2.2",
+  "python-Levenshtein>=0.25.1",
+]
+dev = [
+  "pytest>=8.2.2",
+  "pytest-cov>=5.0.0",
+  "ruff>=0.6.0",
+]
+
+[project.scripts]
+apa = "apa.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
