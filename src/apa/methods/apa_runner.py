@@ -16,6 +16,7 @@ from apa.utils import (
     extract_prediction_text,
     prediction_to_dict,
 )
+from tqdm.auto import tqdm
 
 from .base import CompileResult
 
@@ -67,6 +68,7 @@ class APAMethodRunner:
                 max_steps_per_episode=self.config.max_steps_per_episode,
             )
         )
+        compile_progress_desc = f"{spec.key}/apa compile"
 
         def evaluate_episode(automaton: Automaton, example: Any, ex_idx: int):
             cache_key = self._cache_key(automaton, example, ex_idx)
@@ -89,7 +91,24 @@ class APAMethodRunner:
             )
             return score, features, path
 
-        candidate = optimizer.compile(trainset=trainset, valset=valset, evaluate_episode=evaluate_episode)
+        with tqdm(total=invocation_cap, desc=compile_progress_desc, unit="call", dynamic_ncols=True) as pbar:
+            seen_calls = 0
+
+            def _progress_callback(current_calls: int, _max_calls: int) -> None:
+                nonlocal seen_calls
+                delta = current_calls - seen_calls
+                if delta > 0:
+                    pbar.update(delta)
+                    seen_calls = current_calls
+
+            candidate = optimizer.compile(
+                trainset=trainset,
+                valset=valset,
+                evaluate_episode=evaluate_episode,
+                progress_callback=_progress_callback,
+            )
+            if seen_calls < candidate.metric_calls:
+                pbar.update(candidate.metric_calls - seen_calls)
         cache.persist()
 
         artifacts = {

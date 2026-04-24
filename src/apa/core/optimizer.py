@@ -38,6 +38,7 @@ class Candidate:
 Example = Any
 Dataset = list[Example]
 EvaluateEpisode = Callable[[Automaton, Example, int], tuple[float, dict[str, Any], list[str]]]
+ProgressCallback = Callable[[int, int], None]
 
 
 class APAOptimizer:
@@ -53,13 +54,21 @@ class APAOptimizer:
         trainset: Dataset,
         valset: Dataset,
         evaluate_episode: EvaluateEpisode,
+        progress_callback: ProgressCallback | None = None,
     ) -> Candidate:
         seed_automaton = self._seed_automaton()
         population: list[Candidate] = []
 
-        seed_candidate = self._evaluate_candidate(seed_automaton, trainset, valset, evaluate_episode)
+        seed_candidate = self._evaluate_candidate(
+            seed_automaton,
+            trainset,
+            valset,
+            evaluate_episode,
+            progress_callback=progress_callback,
+        )
         population.append(seed_candidate)
         best = seed_candidate
+        self._maybe_report_progress(progress_callback)
 
         while self.metric_calls < self.config.max_metric_calls:
             parent = self._select_parent(population)
@@ -68,10 +77,17 @@ class APAOptimizer:
                 self.rng,
                 config=_build_mutation_config(self.config),
             )
-            child = self._evaluate_candidate(child_automaton, trainset, valset, evaluate_episode)
+            child = self._evaluate_candidate(
+                child_automaton,
+                trainset,
+                valset,
+                evaluate_episode,
+                progress_callback=progress_callback,
+            )
             population = self._retain(population + [child])
             if child.val_score >= best.val_score:
                 best = child
+            self._maybe_report_progress(progress_callback)
 
             if self.metric_calls >= self.config.max_metric_calls:
                 break
@@ -84,10 +100,21 @@ class APAOptimizer:
         trainset: Dataset,
         valset: Dataset,
         evaluate_episode: EvaluateEpisode,
+        progress_callback: ProgressCallback | None = None,
     ) -> Candidate:
         train_batch = self._sample(trainset, self.config.reflection_minibatch_size)
-        train_score, train_traces = self._evaluate_on_dataset(automaton, train_batch, evaluate_episode)
-        val_score, val_traces = self._evaluate_on_dataset(automaton, valset, evaluate_episode)
+        train_score, train_traces = self._evaluate_on_dataset(
+            automaton,
+            train_batch,
+            evaluate_episode,
+            progress_callback=progress_callback,
+        )
+        val_score, val_traces = self._evaluate_on_dataset(
+            automaton,
+            valset,
+            evaluate_episode,
+            progress_callback=progress_callback,
+        )
         return Candidate(
             automaton=copy.deepcopy(automaton),
             train_score=train_score,
@@ -101,6 +128,7 @@ class APAOptimizer:
         automaton: Automaton,
         dataset: Dataset,
         evaluate_episode: EvaluateEpisode,
+        progress_callback: ProgressCallback | None = None,
     ) -> tuple[float, list[dict[str, Any]]]:
         if not dataset:
             return 0.0, []
@@ -113,6 +141,7 @@ class APAOptimizer:
                 break
             score, features, path = evaluate_episode(automaton, example, ex_idx)
             self.metric_calls += 1
+            self._maybe_report_progress(progress_callback)
             total += score
             traces.append({"example_index": ex_idx, "score": score, "features": features, "path": path})
 
@@ -172,6 +201,11 @@ class APAOptimizer:
             ),
         ]
         return Automaton(states=states, transitions=transitions, start_state="draft")
+
+    def _maybe_report_progress(self, progress_callback: ProgressCallback | None) -> None:
+        if progress_callback is None:
+            return
+        progress_callback(self.metric_calls, self.config.max_metric_calls)
 
 
 def build_episode_executor(automaton: Automaton, max_steps: int) -> AutomatonExecutor:

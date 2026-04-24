@@ -59,6 +59,7 @@ def run_command(
     output_dir: Path | None = typer.Option(None, help="Output run directory"),
     smoke: bool = typer.Option(False, help="Shortcut for smoke dataset mode"),
     dry_run: bool = typer.Option(False, help="Skip optimization/evaluation calls"),
+    quiet: bool = typer.Option(False, "--quiet", help="Disable real-time progress output"),
 ) -> None:
     benchmark = benchmark.lower()
     method = method.lower()
@@ -78,7 +79,13 @@ def run_command(
         output_dir=output_dir,
     )
 
-    result = run_single(benchmark=benchmark, method=method, runtime=runtime, run_dir=output_dir)
+    result = run_single(
+        benchmark=benchmark,
+        method=method,
+        runtime=runtime,
+        run_dir=output_dir,
+        show_progress=not quiet,
+    )
     console.print_json(data=dataclasses.asdict(result))
 
 
@@ -100,6 +107,7 @@ def run_all_command(
     output_dir: Path | None = typer.Option(None, help="Root output directory for matrix run"),
     smoke: bool = typer.Option(False, help="Shortcut for smoke dataset mode"),
     dry_run: bool = typer.Option(False, help="Skip optimization/evaluation calls"),
+    quiet: bool = typer.Option(False, "--quiet", help="Disable real-time progress output"),
 ) -> None:
     benchmark_keys = _parse_csv(benchmarks, allowed=list_benchmark_keys(), label="benchmarks")
     method_keys = _parse_csv(methods, allowed=list_methods(), label="methods")
@@ -120,6 +128,7 @@ def run_all_command(
         runtime=runtime,
         cost_cap_usd=cost_cap_usd,
         root_dir=output_dir,
+        show_progress=not quiet,
     )
 
     payload = {

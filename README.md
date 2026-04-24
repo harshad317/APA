@@ -43,6 +43,11 @@ Build aggregate report:
 apa report aggregate
 ```
 
+By default, runs now stream real-time terminal progress using:
+
+- `rich` (stage logs, run/matrix summary tables)
+- `tqdm` (compile/eval/matrix progress bars)
+
 ---
 
 ## 2) What This Repo Evaluates
@@ -136,6 +141,13 @@ Dry run (no expensive optimization/eval calls):
 
 ```bash
 apa run --benchmark ifbench --method apa --dry-run
+```
+
+Quiet mode (disable live progress output):
+
+```bash
+apa run --benchmark ifbench --method apa --quiet
+apa run-all --seed 0 --quiet
 ```
 
 Aggregate report:
@@ -246,4 +258,3 @@ apa run-all \
   --model openai/gpt-4.1-mini-2025-04-14 \
   --cost-cap-usd 500
 ```
-
