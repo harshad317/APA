@@ -50,6 +50,7 @@ import random
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from threading import Lock
 from typing import Dict, List, Optional
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -82,6 +83,7 @@ from adaptive_prompt_automaton.eval.ifbench_official import (
 # ── GEPA and MIPRO (official DSPy) ────────────────────────────────────────────
 try:
     import dspy
+    from dspy.utils.callback import BaseCallback
     from adaptive_prompt_automaton.search.gepa_dspy import (
         GEPADSPySearch,
         generate_stage1_drafts,
@@ -94,6 +96,31 @@ except ImportError:
 console    = Console(width=160)
 SEED       = 42
 ALL_METHODS = ["apa", "gepa", "mipro"]
+
+
+if _HAS_DSPY:
+    class DSPyAPICallCounter(BaseCallback):
+        """Thread-safe counter for DSPy LM invocations."""
+
+        def __init__(self) -> None:
+            self._lock = Lock()
+            self.count = 0
+
+        def on_lm_start(self, call_id: str, instance: object, inputs: dict) -> None:
+            with self._lock:
+                self.count += 1
+else:
+    class DSPyAPICallCounter:
+        count = 0
+
+
+def _call_count(llm: object) -> int:
+    """Best-effort API-call counter for local LLM wrappers and DSPy counters."""
+    return int(getattr(llm, "call_count", 0) or 0)
+
+
+def _counter_count(counter: object) -> int:
+    return int(getattr(counter, "count", 0) or 0)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -342,7 +369,8 @@ def render_results_table(
     tbl.add_column("Method",          style="bold",  width=26)
     tbl.add_column("Prompt Loose ↑",  style="cyan",  justify="center", width=16)
     tbl.add_column("Instr. Loose ↑",  style="green", justify="center", width=16)
-    tbl.add_column("N",               style="dim",   justify="center", width=6)
+    tbl.add_column("Eval N",          style="dim",   justify="center", width=8)
+    tbl.add_column("API Calls",       style="yellow", justify="right", width=12)
 
     method_styles = {"APA": "cyan", "GEPA": "yellow", "MIPRO": "magenta"}
     best_pl = max((v["prompt_loose"] for v in results.values()), default=0.0)
@@ -351,6 +379,7 @@ def render_results_table(
         pl    = metrics.get("prompt_loose", 0.0)
         il    = metrics.get("instruction_loose", 0.0)
         n     = int(metrics.get("n", 0))
+        calls = int(metrics.get("api_calls", 0))
         style = method_styles.get(method, "white")
         pl_str = (
             f"[bold green]{pl*100:.1f}%[/bold green]"
@@ -358,14 +387,16 @@ def render_results_table(
         )
         tbl.add_row(
             f"[{style}]{method}[/{style}]",
-            pl_str, f"{il*100:.1f}%", str(n),
+            pl_str, f"{il*100:.1f}%", str(n), f"{calls:,}",
         )
 
     console.print(tbl)
     console.print()
     console.print(
         "[dim]prompt_loose = fraction of prompts where ALL constraints pass (loose mode)\n"
-        "instr._loose  = mean fraction of individual constraints that pass[/dim]"
+        "instr._loose  = mean fraction of individual constraints that pass\n"
+        "eval_n        = number of official IFBench test prompts evaluated\n"
+        "api_calls     = live LM calls made during that method's train + eval pipeline[/dim]"
     )
 
 
@@ -377,7 +408,7 @@ def _print_partial(method: str, metrics: Dict[str, float], style: str = "white")
         f"  [{style}]{method}[/{style}]  "
         f"prompt_loose = [bold {style}]{pl:.1f}%[/bold {style}]  "
         f"instr_loose = {il:.1f}%  "
-        f"[dim](n={int(metrics['n'])})[/dim]"
+        f"[dim](eval_n={int(metrics['n'])}, api_calls={int(metrics.get('api_calls', 0)):,})[/dim]"
     )
 
 
@@ -393,6 +424,7 @@ def run_apa(
     scorer:         IFBenchOfficialScorer,
 ) -> Dict[str, float]:
     """Train APA then evaluate on test set.  Returns metrics dict."""
+    api_calls_before = _call_count(llm_apa)
     console.print(Panel(
         "[cyan bold]APA — Evolutionary FSA[/cyan bold]\n"
         "[dim]Training then evaluating on official test set.[/dim]",
@@ -437,6 +469,7 @@ def run_apa(
         workers   = getattr(args, "workers", 4),
         verbose   = getattr(args, "verbose", False),
     )
+    metrics["api_calls"] = _call_count(llm_apa) - api_calls_before
     _print_partial("APA", metrics, "cyan")
     return metrics
 
@@ -450,6 +483,8 @@ def run_gepa(
     scorer:         IFBenchOfficialScorer,
 ) -> tuple:
     """Train GEPA then evaluate on test set.  Returns (metrics, gepa_search)."""
+    call_counter = getattr(args, "dspy_call_counter", None)
+    api_calls_before = _counter_count(call_counter)
     console.print(Panel(
         "[yellow bold]GEPA — dspy.GEPA (official IFBench pipeline)[/yellow bold]\n"
         "[dim]Training then evaluating on official test set.[/dim]",
@@ -478,6 +513,7 @@ def run_gepa(
         workers  = getattr(args, "workers", 4),
         verbose  = getattr(args, "verbose", False),
     )
+    metrics["api_calls"] = _counter_count(call_counter) - api_calls_before
     _print_partial("GEPA", metrics, "yellow")
     return metrics, gepa_search
 
@@ -491,6 +527,8 @@ def run_mipro(
     scorer:         IFBenchOfficialScorer,
 ) -> tuple:
     """Train MIPRO then evaluate on test set.  Returns (metrics, mipro_search)."""
+    call_counter = getattr(args, "dspy_call_counter", None)
+    api_calls_before = _counter_count(call_counter)
     console.print(Panel(
         "[magenta bold]MIPRO — dspy.MIPROv2 (official IFBench pipeline)[/magenta bold]\n"
         "[dim]Training then evaluating on official test set.[/dim]",
@@ -519,6 +557,7 @@ def run_mipro(
         workers  = getattr(args, "workers", 4),
         verbose  = getattr(args, "verbose", False),
     )
+    metrics["api_calls"] = _counter_count(call_counter) - api_calls_before
     _print_partial("MIPRO", metrics, "magenta")
     return metrics, mipro_search
 
@@ -554,6 +593,7 @@ def main(args: argparse.Namespace) -> None:
         f"  Model    : {_model_tag}\n"
         f"  Methods  : [green]{', '.join(methods)}[/green]\n"
         f"  Workers  : [green]{workers}[/green] (parallel LLM calls per eval pass)\n"
+        f"  DSPy cache: [green]disabled[/green] for GEPA/MIPRO\n"
         f"  Train    : [green]{train_size}[/green]  Val: [green]{val_size}[/green]  "
         f"Test: [green]300[/green] (official IFBench)",
         title="[bold]IFBench — APA vs GEPA vs MIPRO[/bold]",
@@ -570,10 +610,21 @@ def main(args: argparse.Namespace) -> None:
     # ── Set up LLMs ────────────────────────────────────────────────────────
     if model != "mock":
         llm_apa = get_llm_api("openai", model=model, api_key=key)
-        dspy_lm = dspy.LM(f"openai/{model}", api_key=key) if _HAS_DSPY else None
+        dspy_counter = DSPyAPICallCounter() if _HAS_DSPY else None
+        dspy_lm = (
+            dspy.LM(
+                f"openai/{model}",
+                api_key=key,
+                cache=False,
+                callbacks=[dspy_counter],
+            )
+            if _HAS_DSPY else None
+        )
+        setattr(args, "dspy_call_counter", dspy_counter)
     else:
         llm_apa = get_llm_api("mock", uncertainty_rate=0.32, latency=0.0, seed=SEED)
         dspy_lm = None
+        setattr(args, "dspy_call_counter", None)
 
     # ── Load official IFBench data ─────────────────────────────────────────
     scorer = IFBenchOfficialScorer()

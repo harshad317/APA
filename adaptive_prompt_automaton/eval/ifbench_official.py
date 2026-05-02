@@ -113,6 +113,20 @@ class IFBenchOfficialScorer:
                 "Make sure vendor/ifbench/ contains the allenai/IFBench files."
             ) from exc
         self._el = _el
+        self._warm_nltk_resources()
+
+    def _warm_nltk_resources(self) -> None:
+        """Preload NLTK resources used by IFBench before threaded scoring."""
+        try:
+            import instructions_util as _iu  # type: ignore[import]
+
+            _iu.count_stopwords("warm up")
+            _iu.split_into_sentences("Warm up.")
+            _iu._get_sentence_tokenizer()
+        except Exception:
+            # Scoring will surface the original verifier error if resources are
+            # genuinely unavailable; this only avoids lazy-load races.
+            pass
 
     # ------------------------------------------------------------------
     # Internal helpers

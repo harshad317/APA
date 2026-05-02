@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import random
 import time
+from threading import Lock
 from typing import Optional, Tuple
 
 
@@ -94,6 +95,7 @@ class MockLLM:
         self.latency          = latency
         self.call_count       = 0
         self.total_tokens     = 0
+        self._lock            = Lock()
         if seed is not None:
             random.seed(seed)
 
@@ -112,7 +114,8 @@ class MockLLM:
         (response_text, token_count)
         """
         time.sleep(self.latency)
-        self.call_count += 1
+        with self._lock:
+            self.call_count += 1
 
         prompt_lower = prompt.lower()
         prompt_words = len(prompt.split())
@@ -151,7 +154,8 @@ class MockLLM:
             response = " ".join(words[:max_words]) + "..."
 
         tokens = int((len(prompt.split()) + len(response.split())) * 1.3)
-        self.total_tokens += tokens
+        with self._lock:
+            self.total_tokens += tokens
         return response, tokens
 
     def __repr__(self) -> str:
@@ -189,6 +193,7 @@ class OpenAILLM:
         )
         self.call_count   = 0
         self.total_tokens = 0
+        self._lock        = Lock()
 
     def call(
         self,
@@ -196,7 +201,8 @@ class OpenAILLM:
         role:       str = "user",
         max_tokens: int = 256,
     ) -> Tuple[str, int]:
-        self.call_count += 1
+        with self._lock:
+            self.call_count += 1
         safe_role = role if role in ("system", "user", "assistant") else "user"
         resp = self.client.chat.completions.create(
             model      = self.model,
@@ -205,7 +211,8 @@ class OpenAILLM:
         )
         text   = resp.choices[0].message.content or ""
         tokens = resp.usage.total_tokens
-        self.total_tokens += tokens
+        with self._lock:
+            self.total_tokens += tokens
         return text, tokens
 
     def __repr__(self) -> str:
