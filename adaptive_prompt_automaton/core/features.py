@@ -3,15 +3,19 @@ core/features.py
 ────────────────
 Runtime feature extraction from LLM inputs and outputs.
 
-Features captured:
+Features captured (all normalised to [0, 1]):
   - input_length          normalised word count of the task input
-  - is_long_input         1.0 if input > 150 words
+  - is_long_input         1.0 if input ≥ long_input_threshold words
   - output_length         normalised word count of the LLM response
   - uncertainty_score     proxy for expressed uncertainty in the output
   - answer_confidence     1 - uncertainty_score
   - self_consistency      Jaccard-based agreement across multiple samples
+                          (ONLY present when ≥2 samples are supplied; omitted
+                          otherwise to avoid the misleading hardcoded-0.8 fallback)
   - has_structured_format 1.0 if the output contains lists / code / headings
-  - verifier_score        external judge score (if provided, else proxy)
+  - verifier_score        external judge score in [0,1]
+                          (ONLY present when an actual score is supplied; omitted
+                          when None to prevent collinearity with answer_confidence)
   - tool_success          1.0 / 0.0 / 0.5 (success / failure / unknown)
   - output_to_input_ratio relative verbosity
   - step_number           normalised execution step index
@@ -133,14 +137,20 @@ class FeatureExtractor:
         has_structured_format = 1.0 if format_hits > 0 else 0.0
 
         # ── Self-consistency ──────────────────────────────────────────
-        consistency = (
+        # Only included when ≥2 real samples are provided.  The previous
+        # hardcoded fallback of 0.8 was a constant with no routing signal —
+        # any guard on self_consistency was a no-op.
+        consistency: Optional[float] = (
             self._self_consistency(samples)
             if samples and len(samples) > 1
-            else 0.8
+            else None
         )
 
         # ── Verifier score ────────────────────────────────────────────
-        v_score = verifier_score if verifier_score is not None else answer_confidence
+        # Only included when a real external verifier score is supplied.
+        # Falling back to answer_confidence makes the two features perfectly
+        # collinear, doubling signal while appearing independent.
+        v_score: Optional[float] = verifier_score  # None when not provided
 
         # ── Tool status ───────────────────────────────────────────────
         if tool_success is True:
@@ -157,19 +167,24 @@ class FeatureExtractor:
         # ── Output length ─────────────────────────────────────────────
         output_length_norm = min(output_words / 200.0, 1.0)
 
-        return FeatureVector(
+        # Build the feature dict, conditionally including optional features
+        feat_kwargs: Dict[str, float] = dict(
             input_length          = input_length_norm,
             is_long_input         = is_long_input,
             output_length         = output_length_norm,
             uncertainty_score     = uncertainty_score,
             answer_confidence     = answer_confidence,
-            self_consistency      = consistency,
             has_structured_format = has_structured_format,
-            verifier_score        = v_score,
             tool_success          = tool_ok,
             output_to_input_ratio = output_to_input_ratio,
             step_number           = min(step / 5.0, 1.0),
         )
+        if consistency is not None:
+            feat_kwargs["self_consistency"] = consistency
+        if v_score is not None:
+            feat_kwargs["verifier_score"] = v_score
+
+        return FeatureVector(**feat_kwargs)
 
     # ------------------------------------------------------------------ #
     @staticmethod
@@ -192,9 +207,19 @@ class FeatureExtractor:
     # ------------------------------------------------------------------ #
     @staticmethod
     def feature_names() -> List[str]:
+        """
+        Returns the names of features that are always present in the vector.
+        self_consistency and verifier_score are conditional (see extract() docs)
+        and are not listed here to avoid misleading callers into expecting them.
+        """
         return [
             "input_length", "is_long_input", "output_length",
-            "uncertainty_score", "answer_confidence", "self_consistency",
-            "has_structured_format", "verifier_score", "tool_success",
+            "uncertainty_score", "answer_confidence",
+            "has_structured_format", "tool_success",
             "output_to_input_ratio", "step_number",
         ]
+
+    @staticmethod
+    def optional_feature_names() -> List[str]:
+        """Features present only when their inputs are supplied."""
+        return ["self_consistency", "verifier_score"]

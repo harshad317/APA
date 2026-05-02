@@ -455,19 +455,39 @@ def main() -> None:
         "[cyan bold]Training APA — Evolutionary Search[/cyan bold]",
         border_style="cyan",
     ))
+    # ── Fixed probe set + fingerprint function for APA ────────────────────
+    probe_tasks_apa  = qa_bench.sample(n=8, seed=SEED)
+    probe_inputs_apa = [t.input_text for t in probe_tasks_apa]
+
+    def fingerprint_fn(task_input: str, response: str) -> float:
+        """Path-independent quality signal: adequate length, complete sentence, no hedging."""
+        words  = response.split()
+        lower  = response.lower()
+        hedge  = any(w in lower for w in ["not sure", "uncertain", "don't know",
+                                           "possibly", "perhaps"])
+        length_ok = 10 <= len(words) <= 150
+        ends_ok   = response.rstrip().endswith((".", "!", "?"))
+        return float(length_ok and ends_ok and not hedge)
+
     apa_seed = build_apa_automaton()
     apa_search = EvolutionarySearch(
-        initial_automaton = apa_seed,
-        llm_api           = llm_apa,
-        feature_extractor = extractor,
-        reward_fn         = composite_reward,
-        population_size   = 8,
-        n_generations     = 10,
-        mutation_rate     = 0.40,
-        elite_frac        = 0.25,
-        tournament_size   = 3,
-        n_eval_tasks      = 5,
-        seed              = SEED,
+        initial_automaton   = apa_seed,
+        llm_api             = llm_apa,
+        feature_extractor   = extractor,
+        reward_fn           = composite_reward,
+        population_size     = 8,
+        n_generations       = 10,
+        mutation_rate       = 0.40,
+        elite_frac          = 0.25,
+        tournament_size     = 3,
+        n_eval_tasks        = 5,
+        seed                = SEED,
+        probe_tasks         = probe_inputs_apa,
+        fingerprint_fn      = fingerprint_fn,
+        diversity_lambda    = 0.10,
+        diversity_threshold = 0.15,
+        diversity_quota     = 1,
+        patience            = 3,
     )
     best_apa   = apa_search.run(train_tasks, console=console)
     apa_calls  = llm_apa.call_count

@@ -8,11 +8,13 @@ Defines the core Adaptive Prompt Automaton data structures:
 """
 from __future__ import annotations
 
+import json
 import uuid
 import copy
+from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -20,6 +22,8 @@ from pydantic import BaseModel, Field
 # ──────────────────────────────────────────────────────────────────────────────
 
 class StateConfig(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     state_id: str = Field(default_factory=lambda: str(uuid.uuid4())[:8])
     name: str
     template: str
@@ -29,11 +33,10 @@ class StateConfig(BaseModel):
     carry_context: bool = True  # carry previous LLM output as {context}
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
-    class Config:
-        extra = "allow"
-
 
 class TransitionConfig(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     transition_id: str = Field(default_factory=lambda: str(uuid.uuid4())[:8])
     source_state: str
     target_state: str
@@ -43,11 +46,10 @@ class TransitionConfig(BaseModel):
     operator: str = ">"             # ">" | "<" | ">=" | "<=" | "==" | "always"
     priority: int = 0               # higher fires first among candidates
 
-    class Config:
-        extra = "allow"
-
 
 class AutomatonConfig(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     automaton_id: str = Field(default_factory=lambda: str(uuid.uuid4())[:8])
     name: str = "PromptAutomaton"
     start_state: str
@@ -55,9 +57,6 @@ class AutomatonConfig(BaseModel):
     transitions: List[TransitionConfig] = Field(default_factory=list)
     max_steps: int = 6
     max_budget: int = 8             # max LLM calls per episode
-
-    class Config:
-        extra = "allow"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -220,6 +219,53 @@ class Automaton:
             "episodes_run": self.episodes_run,
             "path_entropy": round(self.state_visit_entropy(), 4),
         }
+
+    # ------------------------------------------------------------------
+    def save_checkpoint(self, path: str) -> None:
+        """
+        Persist the automaton's config and runtime diagnostics to a JSON file.
+
+        Restoring with Automaton.load_checkpoint(path) reproduces the exact
+        same FSA structure, fitness, and episode history, allowing training
+        runs to be resumed or compared without re-running from scratch.
+        """
+        data = {
+            "config": json.loads(self.config.model_dump_json()),
+            "fitness": self.fitness,
+            "episodes_run": self.episodes_run,
+            # Tuple keys are serialised as pipe-delimited strings
+            "path_counts": {
+                "|".join(k): v for k, v in self.path_counts.items()
+            },
+            "reward_history": self.reward_history,
+            "fingerprint": self.fingerprint,
+        }
+        Path(path).write_text(json.dumps(data, indent=2))
+
+    @classmethod
+    def load_checkpoint(cls, path: str) -> "Automaton":
+        """
+        Restore an Automaton from a JSON checkpoint file written by
+        save_checkpoint().
+
+        Returns
+        -------
+        A fully initialised Automaton with config, fitness, and diagnostics
+        restored from the checkpoint.
+        """
+        data = json.loads(Path(path).read_text())
+        config = AutomatonConfig(**data["config"])
+        aut = cls(config)
+        aut.fitness        = float(data.get("fitness", 0.0))
+        aut.episodes_run   = int(data.get("episodes_run", 0))
+        aut.reward_history = list(data.get("reward_history", []))
+        aut.fingerprint    = list(data.get("fingerprint", []))
+        # Restore path_counts — keys were serialised as pipe-delimited strings
+        aut.path_counts = {
+            tuple(k.split("|")): int(v)
+            for k, v in data.get("path_counts", {}).items()
+        }
+        return aut
 
     def __repr__(self) -> str:
         return (

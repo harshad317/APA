@@ -551,18 +551,43 @@ def main() -> None:
 
     train_inputs = qa_bench.inputs() + train_bench.inputs()
 
+    # ── Fixed probe set + fingerprint function ─────────────────────────────
+    # probe_tasks: a small, fixed task set held constant for the entire run so
+    # fingerprints computed in gen 1 are directly comparable to those in gen 8.
+    # fingerprint_fn: measures path-independent output quality (word count adequacy
+    # + absence of hedging) — not routing markers — so diversity selection reflects
+    # genuine behavioral differences, not which states were visited.
+    probe_tasks = qa_bench.sample(n=8, seed=SEED)
+    probe_inputs = [t.input_text for t in probe_tasks]
+
+    def fingerprint_fn(task_input: str, response: str) -> float:
+        """Path-independent quality signal for fingerprinting."""
+        words  = response.split()
+        lower  = response.lower()
+        hedge  = any(w in lower for w in ["not sure", "uncertain", "don't know",
+                                           "possibly", "perhaps"])
+        length_ok = 10 <= len(words) <= 150
+        ends_ok   = response.rstrip().endswith((".", "!", "?"))
+        return float(length_ok and ends_ok and not hedge)
+
     search = EvolutionarySearch(
-        initial_automaton = apa,
-        llm_api           = llm,
-        feature_extractor = extractor,
-        reward_fn         = composite_reward,
-        population_size   = 8,
-        n_generations     = 10,
-        mutation_rate     = 0.40,
-        elite_frac        = 0.25,
-        tournament_size   = 3,
-        n_eval_tasks      = 5,
-        seed              = SEED,
+        initial_automaton    = apa,
+        llm_api              = llm,
+        feature_extractor    = extractor,
+        reward_fn            = composite_reward,
+        population_size      = 8,
+        n_generations        = 10,
+        mutation_rate        = 0.40,
+        elite_frac           = 0.25,
+        tournament_size      = 3,
+        n_eval_tasks         = 5,
+        seed                 = SEED,
+        probe_tasks          = probe_inputs,
+        fingerprint_fn       = fingerprint_fn,
+        diversity_lambda     = 0.10,
+        diversity_threshold  = 0.15,
+        diversity_quota      = 1,
+        patience             = 3,
     )
 
     best_apa = search.run(train_inputs, console=console)

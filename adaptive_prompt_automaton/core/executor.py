@@ -84,20 +84,25 @@ class AutomatonExecutor:
 
     Parameters
     ----------
-    automaton          : the Automaton FSA to execute
-    llm_api            : object with .call(prompt, role, max_tokens) → (str, int)
-    feature_extractor  : FeatureExtractor instance
+    automaton              : the Automaton FSA to execute
+    llm_api                : object with .call(prompt, role, max_tokens) → (str, int)
+    feature_extractor      : FeatureExtractor instance
+    n_consistency_samples  : number of additional samples to draw per step for
+                             self-consistency estimation (default 1 = disabled).
+                             Each extra sample costs one LLM call against the budget.
     """
 
     def __init__(
         self,
-        automaton:         Automaton,
-        llm_api:           Any,
-        feature_extractor: FeatureExtractor,
+        automaton:             Automaton,
+        llm_api:               Any,
+        feature_extractor:     FeatureExtractor,
+        n_consistency_samples: int = 1,
     ):
-        self.automaton  = automaton
-        self.llm        = llm_api
-        self.extractor  = feature_extractor
+        self.automaton              = automaton
+        self.llm                    = llm_api
+        self.extractor              = feature_extractor
+        self.n_consistency_samples  = max(1, n_consistency_samples)
 
     # ------------------------------------------------------------------
     def run_episode(
@@ -148,17 +153,35 @@ class AutomatonExecutor:
             # ── Render prompt ─────────────────────────────────────────
             prompt = state.render(task_input, context)
 
-            # ── Call LLM ──────────────────────────────────────────────
+            # ── Call LLM (primary response) ───────────────────────────
             response, tokens = self.llm.call(
                 prompt, role=state.role, max_tokens=state.config.max_tokens
             )
             budget_used          += 1
             episode.total_tokens += tokens
 
+            # ── Optional: draw extra samples for self-consistency ─────
+            # Each sample costs one LLM call against the episode budget.
+            consistency_samples: Optional[List[str]] = None
+            if self.n_consistency_samples > 1:
+                extra: List[str] = []
+                for _ in range(self.n_consistency_samples - 1):
+                    if budget_used >= max_budget:
+                        break
+                    s_resp, s_tok = self.llm.call(
+                        prompt, role=state.role, max_tokens=state.config.max_tokens
+                    )
+                    budget_used          += 1
+                    episode.total_tokens += s_tok
+                    extra.append(s_resp)
+                if extra:
+                    consistency_samples = [response] + extra
+
             # ── Extract features ──────────────────────────────────────
             fvec: FeatureVector = self.extractor.extract(
                 task_input  = task_input,
                 llm_output  = response,
+                samples     = consistency_samples,
                 step        = step_idx,
             )
 

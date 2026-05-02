@@ -327,7 +327,12 @@ def crossover(
     return child
 
 
-def mutate(automaton: Automaton, mutation_rate: float, rng: random.Random = random) -> Automaton:
+def mutate(
+    automaton:      Automaton,
+    mutation_rate:  float,
+    rng:            random.Random = random,
+    topology_rate:  float = 0.10,
+) -> Automaton:
     """
     Return a mutated copy of an automaton.
 
@@ -337,18 +342,29 @@ def mutate(automaton: Automaton, mutation_rate: float, rng: random.Random = rand
           producing fingerprint-distinct behavioral modes.
       - 70 % chance of surface wording mutation (word swaps + addon).
     Guard thresholds are perturbed independently.
+
+    Topology mutation (new — Fix 10):
+      Applied with probability topology_rate (default 10 %) per mutate() call.
+      Operators (chosen uniformly):
+        1. add_bypass_transition   — adds a high-confidence direct start→terminal edge.
+        2. add_recheck_state       — inserts a "recheck" state between verify and terminal.
+        3. rewire_transition_target — redirects a non-essential threshold transition.
+        4. remove_nonessential_transition — removes a threshold guard (never the only
+                                           escape from a non-terminal state).
+    FSA validity invariants maintained:
+      - Every non-terminal state retains at least one outgoing transition.
+      - start_state and all terminal states are never removed.
     """
     child = automaton.copy()
 
+    # ── Template + threshold mutations ───────────────────────────────
     for sid in child.config.states:
         if rng.random() < mutation_rate:
-            # Structural mutation: swap to a different strategy template (Fix 1)
             if rng.random() < 0.30:
                 new_template = mutate_strategy(sid, rng=rng)
                 if new_template:
                     child.config.states[sid].template = new_template
                     continue
-            # Surface wording mutation
             child.config.states[sid].template = mutate_template(
                 child.config.states[sid].template,
                 intensity=0.35,
@@ -358,6 +374,147 @@ def mutate(automaton: Automaton, mutation_rate: float, rng: random.Random = rand
     for t in child.config.transitions:
         if t.guard_type == "threshold" and rng.random() < mutation_rate:
             t.threshold = mutate_threshold(t.threshold, rng=rng)
+
+    # ── Topology mutation ─────────────────────────────────────────────
+    if rng.random() < topology_rate:
+        child = mutate_topology(child, rng=rng)
+
+    return child
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Topology mutation  (Fix 10 — FSA graph-level evolution)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def mutate_topology(automaton: Automaton, rng: random.Random = random) -> Automaton:
+    """
+    Apply one randomly chosen FSA graph-level mutation to a copy of automaton.
+
+    Operators
+    ─────────
+    1. add_bypass_transition     — add a high-confidence start→terminal edge so
+                                   very confident answers skip intermediate states.
+    2. add_recheck_state         — clone verify into a "recheck" node and wire
+                                   verify→recheck→terminal.
+    3. rewire_transition_target  — pick a non-essential threshold transition and
+                                   redirect its target to a random other state.
+    4. remove_nonessential_transition — drop a threshold guard, provided its
+                                        source state keeps at least one outgoing edge.
+
+    Validity guarantee: start_state and terminal states are never removed; every
+    non-terminal state always retains at least one outgoing transition.
+    """
+    import uuid as _uuid
+    from ..core.automaton import StateConfig, TransitionConfig  # local import to avoid circular
+
+    child = automaton.copy()
+    ops   = ["add_bypass", "add_recheck", "rewire", "remove"]
+    op    = rng.choice(ops)
+
+    terminal_ids = {sid for sid, sc in child.config.states.items() if sc.is_terminal}
+    non_terminal_ids = [sid for sid in child.config.states if sid not in terminal_ids]
+
+    # Helper: transitions leaving a given state
+    def transitions_from(sid: str):
+        return [t for t in child.config.transitions if t.source_state == sid]
+
+    if op == "add_bypass":
+        # Add a direct high-confidence start→terminal edge if one doesn't exist.
+        start = child.config.start_state
+        any_terminal = next(iter(terminal_ids), None)
+        if any_terminal:
+            already = any(
+                t.source_state == start and t.target_state == any_terminal
+                and t.feature_name == "answer_confidence"
+                for t in child.config.transitions
+            )
+            if not already:
+                child.config.transitions.append(TransitionConfig(
+                    transition_id = _uuid.uuid4().hex[:8],
+                    source_state  = start,
+                    target_state  = any_terminal,
+                    guard_type    = "threshold",
+                    feature_name  = "answer_confidence",
+                    operator      = ">=",
+                    threshold     = rng.uniform(0.80, 0.95),
+                    priority      = 0,   # lowest — only fires when nothing else does
+                ))
+
+    elif op == "add_recheck":
+        # Clone the verify state as a "recheck" node and insert it before terminal.
+        if "verify" in child.config.states and terminal_ids:
+            recheck_id = f"recheck_{_uuid.uuid4().hex[:4]}"
+            verify_sc  = child.config.states["verify"]
+            child.config.states[recheck_id] = StateConfig(
+                state_id      = recheck_id,
+                name          = "Recheck",
+                template      = verify_sc.template.replace("Verify", "Re-verify")
+                                if "Verify" in verify_sc.template
+                                else "Final check — task: {input}\nDraft: {context}\nOutput the corrected answer.",
+                role          = verify_sc.role,
+                max_tokens    = verify_sc.max_tokens,
+                is_terminal   = False,
+                carry_context = True,
+            )
+            any_terminal = next(iter(terminal_ids))
+            # verify → recheck (always)
+            child.config.transitions.append(TransitionConfig(
+                transition_id = _uuid.uuid4().hex[:8],
+                source_state  = "verify",
+                target_state  = recheck_id,
+                guard_type    = "always",
+                operator      = "always",
+                priority      = 10,   # fires before existing verify→terminal
+            ))
+            # recheck → terminal (always)
+            child.config.transitions.append(TransitionConfig(
+                transition_id = _uuid.uuid4().hex[:8],
+                source_state  = recheck_id,
+                target_state  = any_terminal,
+                guard_type    = "always",
+                operator      = "always",
+                priority      = 1,
+            ))
+            # Remove any old verify→terminal always transitions (they are now bypassed)
+            child.config.transitions = [
+                t for t in child.config.transitions
+                if not (t.source_state == "verify"
+                        and t.target_state in terminal_ids
+                        and t.guard_type == "always"
+                        and t.priority < 10)
+            ]
+
+    elif op == "rewire":
+        # Redirect a non-essential threshold transition to a different valid target.
+        threshold_ts = [
+            t for t in child.config.transitions
+            if t.guard_type == "threshold"
+        ]
+        if threshold_ts and len(child.config.states) > 2:
+            chosen = rng.choice(threshold_ts)
+            valid_targets = [
+                sid for sid in child.config.states
+                if sid != chosen.source_state and sid != chosen.target_state
+            ]
+            if valid_targets:
+                chosen.target_state = rng.choice(valid_targets)
+
+    elif op == "remove":
+        # Remove a threshold transition provided its source keeps ≥1 outgoing edge.
+        threshold_ts = [
+            t for t in child.config.transitions
+            if t.guard_type == "threshold"
+        ]
+        removable = [
+            t for t in threshold_ts
+            if len(transitions_from(t.source_state)) > 1
+        ]
+        if removable:
+            victim = rng.choice(removable)
+            child.config.transitions = [
+                t for t in child.config.transitions
+                if t is not victim
+            ]
 
     return child
 
@@ -445,6 +602,11 @@ class EvolutionarySearch:
         # Probe-task evaluation within a single individual remains sequential;
         # population-level parallelism is embarrassingly parallel (no shared state).
         workers:             int   = 1,
+        # Early stopping — stop when best fitness has not improved by more than
+        # improvement_threshold for this many consecutive generations.
+        # Set patience=0 (default) to disable and always run all n_generations.
+        patience:            int   = 0,
+        improvement_threshold: float = 1e-4,
     ):
         self.template_automaton  = initial_automaton
         self.llm                 = llm_api
@@ -469,7 +631,10 @@ class EvolutionarySearch:
         # Fingerprinting active only when both probe_tasks and fingerprint_fn given
         self._fingerprinting     = (probe_tasks is not None and fingerprint_fn is not None)
         # Parallelism
-        self.workers             = max(1, workers)
+        self.workers              = max(1, workers)
+        # Early stopping
+        self.patience             = max(0, patience)
+        self.improvement_threshold = improvement_threshold
 
         # Diagnostics
         self.history:        List[Dict[str, Any]] = []
@@ -816,8 +981,9 @@ class EvolutionarySearch:
         console.print("[yellow]Evaluating initial population…[/yellow]")
         self._evaluate_batch(population, train_tasks, desc="Init Eval", colour="cyan")
 
-        # ── Generational loop ──────────────────────────────────────────────
+        # ── Generational loop ─────────────────────��────────────────────────
         gen_bar = tqdm(range(self.n_generations), desc="  Generations", colour="green")
+        no_improvement_streak = 0   # consecutive generations without improvement
 
         for gen in gen_bar:
 
@@ -826,10 +992,16 @@ class EvolutionarySearch:
             gen_mean  = sum(a.fitness for a in population) / len(population)
             gen_worst = population[-1].fitness
 
-            # Track global best
+            # Track global best + early-stopping streak counter
+            prev_best = self.best_fitness
             if gen_best.fitness > self.best_fitness:
                 self.best_fitness   = gen_best.fitness
                 self.best_automaton = gen_best.copy(copy_diagnostics=True)
+
+            if self.best_fitness - prev_best > self.improvement_threshold:
+                no_improvement_streak = 0
+            else:
+                no_improvement_streak += 1
 
             self.history.append({
                 "generation":    gen,
@@ -838,6 +1010,10 @@ class EvolutionarySearch:
                 "worst_fitness": gen_worst,
             })
 
+            patience_str = (
+                f"  patience={no_improvement_streak}/{self.patience}"
+                if self.patience > 0 else ""
+            )
             gen_bar.set_postfix({
                 "best":  f"{gen_best.fitness:.3f}",
                 "mean":  f"{gen_mean:.3f}",
@@ -846,6 +1022,15 @@ class EvolutionarySearch:
 
             if gen % 3 == 0 or gen == self.n_generations - 1:
                 self._print_gen_table(gen, population[:5], console)
+
+            # ── Early stopping check ───────────────────────────────────────
+            if self.patience > 0 and no_improvement_streak >= self.patience:
+                console.print(
+                    f"[yellow]Early stopping at generation {gen}: "
+                    f"no improvement > {self.improvement_threshold} "
+                    f"for {self.patience} consecutive generations.[/yellow]"
+                )
+                break
 
             # ── Elite selection with diversity quota (Fix 3) ───────────────
             elite = self._diversity_aware_select(population)
@@ -874,12 +1059,14 @@ class EvolutionarySearch:
 
             population = new_pop
 
-        # ── Final summary ──────────────────────────────────────────────────
+        # ── Final summary ─────────────��─────────────────────────────��──────
+        gens_run = len(self.history)
         console.print(Panel(
             f"[bold green]Training complete![/bold green]\n\n"
             f"  Best fitness  : [cyan]{self.best_fitness:.4f}[/cyan]\n"
-            f"  Generations   : [cyan]{self.n_generations}[/cyan]\n"
-            f"  Total LLM calls so far: [cyan]{self.llm.call_count}[/cyan]",
+            f"  Generations   : [cyan]{gens_run}[/cyan] / {self.n_generations}"
+            + (f"  [dim](early stopped)[/dim]" if gens_run < self.n_generations else "") +
+            f"\n  Total LLM calls so far: [cyan]{self.llm.call_count}[/cyan]",
             title="[bold]Search Results[/bold]",
             border_style="green",
         ))

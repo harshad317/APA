@@ -1,0 +1,29 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "adaptive-prompt-automaton"
+version = "0.1.0"
+description = "Stateful prompt policy for LLM workflows — a finite-state automaton over prompt templates."
+requires-python = ">=3.10"
+dependencies = [
+    "pydantic>=2.0",
+    "rich>=13.0",
+    "tqdm>=4.60",
+]
+
+[project.optional-dependencies]
+openai = ["openai>=1.0"]
+dev    = ["pytest>=7.0", "pytest-cov"]
+
+[project.scripts]
+run-demo = "adaptive_prompt_automaton.__main__:run_demo"
+compare  = "adaptive_prompt_automaton.__main__:run_compare"
+
+[tool.hatch.build.targets.wheel]
+packages = ["adaptive_prompt_automaton"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts   = "-v"

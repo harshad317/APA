@@ -82,48 +82,75 @@ def composite_reward(
     episode:             Episode,
     token_budget:        int   = 1500,
     uncertainty_penalty: float = 0.15,
-    structure_bonus:     float = 0.15,
+    completeness_bonus:  float = 0.15,
     terminal_bonus:      float = 0.20,
-    multi_step_bonus:    float = 0.10,
+    multi_step_bonus:    float = 0.05,
+    expected:            str   = "",
+    lexical_bonus:       float = 0.10,
 ) -> float:
     """
-    Composite reward combining:
-      + base score (0.5 for non-empty output)
-      + structure_bonus if response contains structured reasoning
-      + terminal_bonus  if episode terminated cleanly at terminal state
-      + multi_step_bonus if path length > 1 (adaptive routing fired)
+    Composite reward that measures output quality independently of the route
+    taken through the automaton.
+
+    Previous versions awarded bonuses for "step 1", "decompos", "verified", etc.
+    — strings that MockLLM generates specifically when routed through decompose/
+    verify states.  That caused the optimizer to learn to route, not to answer,
+    producing circular self-reward.
+
+    This version uses path-independent quality signals:
+
+      + base score          (0.5 for ≥10 words — substantive response)
+      + completeness_bonus  if output ends with a complete sentence and has ≥20 words
+      + lexical_bonus       if expected is provided and output overlaps ≥ 1 key term
+      + terminal_bonus      if episode reached a terminal state cleanly
+      + multi_step_bonus    (small, 0.05) if adaptive routing fired at all
       - uncertainty_penalty if output hedges heavily
-      - token_penalty proportional to token over-use
+      - token_penalty       proportional to token over-use
     """
-    out   = episode.final_output.lower()
+    out   = episode.final_output
+    lower = out.lower()
+    words = out.split()
     score = 0.0
 
-    # Base reward for producing a non-trivial answer
-    if len(out.split()) >= 5:
+    # Base reward for a substantive answer (at least 10 words)
+    if len(words) >= 10:
         score += 0.5
 
-    # Penalise excessive hedging
-    hedge_words = ["not sure", "uncertain", "don't know", "possibly", "perhaps"]
-    if any(w in out for w in hedge_words):
+    # Penalise excessive hedging — path-independent lexical signal
+    hedge_words = ["not sure", "uncertain", "don't know", "possibly", "perhaps",
+                   "not entirely certain", "i'm not confident"]
+    n_hedges = sum(1 for w in hedge_words if w in lower)
+    if n_hedges >= 2:
         score -= uncertainty_penalty
+    elif n_hedges == 1:
+        score -= uncertainty_penalty * 0.5
 
-    # Reward structured reasoning (decomposition / step-by-step)
-    structure_markers = ["step 1", "step 2", "first,", "second,", "step-by-step",
-                         "decompos", "verified", "correct", "confirmed"]
-    if any(m in out for m in structure_markers):
-        score += structure_bonus
+    # Completeness bonus: response has ≥20 words and ends with sentence-ending punctuation.
+    # This rewards thorough, well-formed answers regardless of which state produced them.
+    if len(words) >= 20 and out.rstrip().endswith((".", "!", "?")):
+        score += completeness_bonus
 
-    # Terminal-state bonus
+    # Lexical overlap bonus: when an expected answer is provided, reward responses
+    # that contain at least one key term from the expected answer.  This is a weak
+    # factual-correctness proxy that does not depend on routing markers.
+    if expected:
+        exp_tokens = set(expected.lower().split())
+        out_tokens = set(lower.split())
+        if exp_tokens & out_tokens:
+            score += lexical_bonus
+
+    # Terminal-state bonus (rewards clean FSA termination, not specific route)
     if episode.terminated_by == "terminal_state":
         score += terminal_bonus
 
-    # Multi-step bonus (branching actually fired)
+    # Small multi-step bonus — legitimately rewards adaptivity, but kept small (0.05)
+    # so it cannot dominate the reward signal.
     if len(episode.path) > 1:
         score += multi_step_bonus
 
     # Token cost penalty
-    over   = max(0, episode.total_tokens - token_budget)
-    t_pen  = min(over / token_budget, 0.25)
+    over  = max(0, episode.total_tokens - token_budget)
+    t_pen = min(over / token_budget, 0.25)
     score -= t_pen
 
     return max(-1.0, min(1.0, score))

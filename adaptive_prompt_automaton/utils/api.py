@@ -96,8 +96,9 @@ class MockLLM:
         self.call_count       = 0
         self.total_tokens     = 0
         self._lock            = Lock()
-        if seed is not None:
-            random.seed(seed)
+        # Use an instance-level RNG so concurrent workers never share state.
+        # Module-level random.seed() is NOT thread-safe and was removed.
+        self.rng = random.Random(seed)
 
     # ------------------------------------------------------------------
     def call(
@@ -122,28 +123,28 @@ class MockLLM:
 
         # ── Route by prompt content ───────────────────────────────────
         if any(kw in prompt_lower for kw in ("verify", "double-check", "is this correct", "confirm")):
-            response = random.choice(self._VERIFICATION_RESPONSES)
+            response = self.rng.choice(self._VERIFICATION_RESPONSES)
 
         elif any(kw in prompt_lower for kw in ("decompose", "break down", "step by step", "systematically")):
-            n_steps = random.randint(3, 5)
+            n_steps = self.rng.randint(3, 5)
             response = " ".join(self._DECOMP_STEPS[:n_steps])
 
         elif prompt_words > 200:
-            response = random.choice(self._LONG_INPUT_RESPONSES)
+            response = self.rng.choice(self._LONG_INPUT_RESPONSES)
             # Long inputs often produce hedged answers
-            if random.random() < self.uncertainty_rate + 0.15:
+            if self.rng.random() < self.uncertainty_rate + 0.15:
                 response = "I'm not entirely certain about all aspects. " + response
 
         else:
             # Standard answer
-            category = random.choice(list(self._ANSWER_POOL.keys()))
-            ans = random.choice(self._ANSWER_POOL[category])
+            category = self.rng.choice(list(self._ANSWER_POOL.keys()))
+            ans = self.rng.choice(self._ANSWER_POOL[category])
 
             is_complex = prompt_words > 60
-            if is_complex and random.random() < self.uncertainty_rate:
-                template = random.choice(self._UNCERTAINTY_HEDGE)
+            if is_complex and self.rng.random() < self.uncertainty_rate:
+                template = self.rng.choice(self._UNCERTAINTY_HEDGE)
             else:
-                template = random.choice(self._CONFIDENT)
+                template = self.rng.choice(self._CONFIDENT)
             response = template.format(ans=ans)
 
         # ── Truncate to token budget ──────────────────────────────────
