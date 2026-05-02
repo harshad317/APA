@@ -158,6 +158,14 @@ class Automaton:
         self.path_counts: Dict[Tuple[str, ...], int] = {}
         self.reward_history: List[float] = []
 
+        # Behavioral fingerprint — per-probe-task score vector (Fix 5).
+        # Populated by EvolutionarySearch._evaluate() when probe_tasks active.
+        self.fingerprint: List[float] = []
+
+        # Diversity selection scratch space (set by _diversity_aware_select).
+        self._diversity_bonus:    float = 0.0
+        self._augmented_fitness:  float = 0.0
+
     # ------------------------------------------------------------------
     def get_transitions_from(self, state_id: str) -> List[Transition]:
         """Return all transitions leaving state_id, sorted by priority desc."""
@@ -192,11 +200,12 @@ class Automaton:
         new_config.automaton_id = str(uuid.uuid4())[:8]
         new_config.name = self.name + "_copy"
         child = Automaton(new_config)
-        child.fitness = self.fitness
+        child.fitness     = self.fitness
+        child.fingerprint = list(self.fingerprint)      # carry fingerprint across copy
         if copy_diagnostics:
-            child.episodes_run = self.episodes_run
-            child.path_counts = dict(self.path_counts)
-            child.reward_history = list(self.reward_history)
+            child.episodes_run    = self.episodes_run
+            child.path_counts     = dict(self.path_counts)
+            child.reward_history  = list(self.reward_history)
         return child
 
     # ------------------------------------------------------------------

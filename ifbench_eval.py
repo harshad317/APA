@@ -196,6 +196,116 @@ def build_apa_seed() -> Automaton:
 # APA training helpers
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _build_stratified_probe_set(
+    examples: List[IFBenchOfficialExample],
+    n: int = 20,
+    seed: int = 42,
+) -> List[IFBenchOfficialExample]:
+    """
+    Select a fixed probe set that maximally covers IFBench constraint categories.
+
+    Fix 2: stratify by the primary constraint category (first token of the first
+    instruction_id, e.g. 'count', 'format', 'keyword') so the probe set covers
+    the latent skill space rather than being a uniform random sample.  A uniform
+    sample risks selecting tasks that are highly correlated in what they require,
+    making fingerprints indistinguishable.
+
+    Fix 4: the returned set is fixed for the entire training run — no refresh —
+    so fingerprint vectors computed in generation 1 are directly comparable to
+    those in generation 8.
+
+    Parameters
+    ----------
+    examples : pool to sample from (train set preferred; no test-set leakage)
+    n        : target probe set size (default matches --apa-eval-tasks)
+    seed     : fixed seed for reproducibility
+
+    Returns
+    -------
+    List of up to n IFBenchOfficialExample objects, stratified by constraint cat.
+    """
+    rng = random.Random(seed)
+
+    # Group examples by primary constraint category
+    groups: Dict[str, List[IFBenchOfficialExample]] = {}
+    for ex in examples:
+        if ex.instruction_id_list:
+            raw_id = ex.instruction_id_list[0]
+            cat    = raw_id.split(":")[0] if ":" in raw_id else raw_id
+        else:
+            cat = "uncategorised"
+        groups.setdefault(cat, []).append(ex)
+
+    cats     = sorted(groups.keys())
+    per_cat  = max(1, n // max(len(cats), 1))
+
+    selected: List[IFBenchOfficialExample] = []
+    seen_keys: set = set()
+
+    # Proportional sampling from each category
+    for cat in cats:
+        members = list(groups[cat])
+        rng.shuffle(members)
+        for ex in members:
+            if ex.key not in seen_keys and len(selected) < n:
+                selected.append(ex)
+                seen_keys.add(ex.key)
+                if len(selected) - sum(1 for e in selected if
+                        (e.instruction_id_list[0].split(":")[0]
+                         if e.instruction_id_list else "x") == cat) >= per_cat:
+                    break
+
+    # Fill remainder if categories ran short
+    if len(selected) < n:
+        remaining = [ex for ex in examples if ex.key not in seen_keys]
+        rng.shuffle(remaining)
+        for ex in remaining:
+            if len(selected) >= n:
+                break
+            selected.append(ex)
+            seen_keys.add(ex.key)
+
+    return selected[:n]
+
+
+def _make_fingerprint_fn(
+    scorer:         "IFBenchOfficialScorer",
+    probe_examples: List[IFBenchOfficialExample],
+) -> Callable[[str, str], float]:
+    """
+    Create the fingerprint function passed to EvolutionarySearch.
+
+    Fix 5: fingerprint values are derived from the same episode evaluation that
+    computes fitness — zero additional API calls.  Each probe task contributes
+    one float (instruction_loose ∈ [0, 1]) to the fingerprint vector.
+
+    Using instruction_loose (continuous) rather than prompt_loose (binary) gives
+    a more discriminating signal: two prompts that both fail a task may still
+    have different constraint-level pass rates, yielding different fingerprints
+    and landing in different clusters.
+
+    Parameters
+    ----------
+    scorer         : IFBenchOfficialScorer instance
+    probe_examples : the fixed probe set (same list passed to EvolutionarySearch)
+
+    Returns
+    -------
+    fingerprint_fn(task_input, response) → float ∈ [0, 1]
+    """
+    prompt_to_example: Dict[str, IFBenchOfficialExample] = {
+        ex.prompt: ex for ex in probe_examples
+    }
+
+    def fingerprint_fn(task_input: str, response: str) -> float:
+        ex = prompt_to_example.get(task_input)
+        if ex is None:
+            return 0.0
+        return scorer.instruction_loose(ex, response)
+
+    return fingerprint_fn
+
+
 def _apa_train_tasks_from_ifbench(
     examples: List[IFBenchOfficialExample],
 ) -> List[Task]:
@@ -474,17 +584,46 @@ def run_apa(
     )
     reward_label = "official IFBench verifier" if train_examples else "composite proxy"
     console.print(f"  [dim]APA reward:[/dim] {reward_label}")
+
+    # ── Build fixed stratified probe set (Fixes 2 & 4) ───────────────────
+    # Probe set is selected once here and held constant for the entire run.
+    # Size = apa_eval_tasks so API cost is identical to the previous random-
+    # sample approach — fingerprinting is free (Fix 5).
+    apa_eval_tasks_n = min(getattr(args, "apa_eval_tasks", 5), len(apa_tasks))
+    probe_pool = train_examples if train_examples else []
+    probe_examples: List[IFBenchOfficialExample] = []
+    fp_fn = None
+    if probe_pool and apa_eval_tasks_n > 0:
+        probe_examples = _build_stratified_probe_set(
+            probe_pool,
+            n    = apa_eval_tasks_n,
+            seed = SEED,
+        )
+        fp_fn = _make_fingerprint_fn(scorer, probe_examples)
+        console.print(
+            f"  [dim]Probe set: {len(probe_examples)} stratified tasks "
+            f"(fixed for full run — Fixes 2/4/5)[/dim]"
+        )
+
+    probe_task_inputs = [ex.prompt for ex in probe_examples] if probe_examples else None
+
     apa_search = EvolutionarySearch(
-        initial_automaton = build_apa_seed(),
-        llm_api           = llm_apa,
-        feature_extractor = extractor,
-        reward_fn         = reward_fn,
-        n_generations     = 8,
-        mutation_rate     = 0.40,
-        elite_frac        = 0.25,
-        tournament_size   = 3,
-        n_eval_tasks      = min(getattr(args, "apa_eval_tasks", 5), len(apa_tasks)),
-        seed              = SEED,
+        initial_automaton    = build_apa_seed(),
+        llm_api              = llm_apa,
+        feature_extractor    = extractor,
+        reward_fn            = reward_fn,
+        n_generations        = 8,
+        mutation_rate        = 0.40,
+        elite_frac           = 0.25,
+        tournament_size      = 3,
+        n_eval_tasks         = apa_eval_tasks_n,
+        seed                 = SEED,
+        # Diversity regularisation (Fixes 1–5)
+        probe_tasks          = probe_task_inputs,
+        fingerprint_fn       = fp_fn,
+        diversity_lambda     = 0.10,
+        diversity_threshold  = 0.15,
+        diversity_quota      = 1,
     )
     best_automaton = apa_search.run(
         [t.input_text for t in apa_tasks], console=console
