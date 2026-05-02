@@ -278,6 +278,7 @@ class MIPRODSPySearch:
         val_examples:   Optional[List[IFBenchOfficialExample]] = None,
         dspy_lm:        Any                              = None,
         seed:           int                              = 42,
+        workers:        int                              = 1,
         # Kept for backward compat with compare.py (ignored when IFBench path active)
         n_eval_tasks:     int   = 5,
         uncertainty_rate: float = 0.15,
@@ -292,6 +293,7 @@ class MIPRODSPySearch:
         self.val_examples   = val_examples   or []
         self.dspy_lm        = dspy_lm
         self.seed           = seed
+        self.workers        = workers
 
         # backward-compat properties
         self.n_eval_tasks     = n_eval_tasks
@@ -350,9 +352,16 @@ class MIPRODSPySearch:
         dspy.configure(lm=self.dspy_lm)
 
         # Stage 1 drafts
-        console.print("  [dim]Stage 1: generating draft answers …[/dim]")
-        train_drafts = generate_stage1_drafts(self.train_examples, self.dspy_lm)
-        val_drafts   = generate_stage1_drafts(self.val_examples,   self.dspy_lm)
+        console.print(
+            f"  [dim]Stage 1: generating draft answers "
+            f"(workers={self.workers}) …[/dim]"
+        )
+        train_drafts = generate_stage1_drafts(
+            self.train_examples, self.dspy_lm, workers=self.workers
+        )
+        val_drafts = generate_stage1_drafts(
+            self.val_examples, self.dspy_lm, workers=self.workers
+        )
 
         trainset = [_to_dspy_example(ex, d) for ex, d in zip(self.train_examples, train_drafts)]
         valset   = [_to_dspy_example(ex, d) for ex, d in zip(self.val_examples,   val_drafts)]

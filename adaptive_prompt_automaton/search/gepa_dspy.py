@@ -40,6 +40,7 @@ Requirements
 from __future__ import annotations
 
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, List, Optional
 
 try:
@@ -137,30 +138,38 @@ else:
 def generate_stage1_drafts(
     examples: List[IFBenchOfficialExample],
     lm:       Any,
+    workers:  int = 1,
 ) -> List[str]:
     """
     Run stage-1 for every example: fixed "Respond to the query" prompt.
 
     Returns a list of draft strings aligned with `examples`.
+    When workers > 1, drafts are generated in parallel via ThreadPoolExecutor.
     """
     if not _HAS_DSPY:
         return [""] * len(examples)
 
-    drafts: List[str] = []
     stage1_sig = dspy.Signature("prompt -> draft_answer").with_instructions(
         IFBenchRewriterProgram.STAGE1_INSTRUCTION
     )
-    stage1_predict = dspy.Predict(stage1_sig)
 
-    with dspy.context(lm=lm):
-        for ex in examples:
+    def _one(ex: IFBenchOfficialExample) -> str:
+        predict = dspy.Predict(stage1_sig)
+        with dspy.context(lm=lm):
             try:
-                pred   = stage1_predict(prompt=ex.prompt)
-                draft  = str(getattr(pred, "draft_answer", "") or "")
+                pred  = predict(prompt=ex.prompt)
+                return str(getattr(pred, "draft_answer", "") or "")
             except Exception:
-                draft  = ""
-            drafts.append(draft)
+                return ""
 
+    if workers <= 1:
+        return [_one(ex) for ex in examples]
+
+    drafts: List[str] = [""] * len(examples)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        fut_to_idx = {pool.submit(_one, ex): i for i, ex in enumerate(examples)}
+        for fut in as_completed(fut_to_idx):
+            drafts[fut_to_idx[fut]] = fut.result()
     return drafts
 
 
@@ -245,6 +254,7 @@ class GEPADSPySearch:
         val_examples:   Optional[List[IFBenchOfficialExample]] = None,
         dspy_lm:        Any                             = None,
         seed:           int                             = 42,
+        workers:        int                             = 1,
     ) -> None:
         if not _HAS_DSPY:
             raise ImportError("dspy>=3.0.0 required. Install with: pip install dspy")
@@ -254,6 +264,7 @@ class GEPADSPySearch:
         self.val_examples   = val_examples   or []
         self.dspy_lm        = dspy_lm
         self.seed           = seed
+        self.workers        = workers
 
         self.optimised_program: Optional[IFBenchRewriterProgram] = None
 
@@ -289,9 +300,16 @@ class GEPADSPySearch:
         dspy.configure(lm=self.dspy_lm)
 
         # ── Stage 1: generate drafts ──────────────────────────────────
-        console.print("  [dim]Stage 1: generating draft answers …[/dim]")
-        train_drafts = generate_stage1_drafts(self.train_examples, self.dspy_lm)
-        val_drafts   = generate_stage1_drafts(self.val_examples,   self.dspy_lm)
+        console.print(
+            f"  [dim]Stage 1: generating draft answers "
+            f"(workers={self.workers}) …[/dim]"
+        )
+        train_drafts = generate_stage1_drafts(
+            self.train_examples, self.dspy_lm, workers=self.workers
+        )
+        val_drafts = generate_stage1_drafts(
+            self.val_examples, self.dspy_lm, workers=self.workers
+        )
 
         trainset = [
             _to_dspy_example(ex, draft)

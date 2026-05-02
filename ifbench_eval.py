@@ -19,6 +19,10 @@ Each method works as it does in its respective paper:
            Trained on IF-RLVR pool with Bayesian instruction optimisation.
            Scored with the official allenai/IFBench constraint verifiers.
 
+Methods run sequentially — each method fully completes (train → eval) before
+the next one begins.  Within each eval pass, LLM calls are dispatched in
+parallel via ThreadPoolExecutor (--workers N, default 4).
+
 All three methods are evaluated on the official IFBench test set (300 prompts)
 using prompt_loose accuracy — the primary metric from the IFBench paper.
 
@@ -30,11 +34,8 @@ Usage
   # Mock mode (APA only — GEPA/MIPRO need a real LLM)
   python ifbench_eval.py --methods apa
 
-  # Custom split sizes
-  python ifbench_eval.py --model gpt-4.1-mini --train-size 200 --val-size 100
-
-  # Skip GEPA/MIPRO training, only run APA
-  python ifbench_eval.py --methods apa --model mock
+  # Custom split sizes + parallelism
+  python ifbench_eval.py --model gpt-4.1-mini --train-size 200 --val-size 100 --workers 8
 
 Data
 ────
@@ -47,6 +48,7 @@ import argparse
 import os
 import random
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -80,7 +82,10 @@ from adaptive_prompt_automaton.eval.ifbench_official import (
 # ── GEPA and MIPRO (official DSPy) ────────────────────────────────────────────
 try:
     import dspy
-    from adaptive_prompt_automaton.search.gepa_dspy import GEPADSPySearch
+    from adaptive_prompt_automaton.search.gepa_dspy import (
+        GEPADSPySearch,
+        generate_stage1_drafts,
+    )
     from adaptive_prompt_automaton.search.mipro_dspy import MIPRODSPySearch
     _HAS_DSPY = True
 except ImportError:
@@ -179,18 +184,8 @@ def _apa_train_tasks_from_ifbench(
     ]
 
 
-def _apa_reward_for_ifbench(
-    episode:  Episode,
-    example:  IFBenchOfficialExample,
-    scorer:   IFBenchOfficialScorer,
-) -> float:
-    """APA reward on IFBench: official prompt_loose score."""
-    response = episode.final_output or ""
-    return scorer.prompt_loose(example, response)
-
-
 # ══════════════════════════════════════════════════════════════════════════════
-# APA evaluation on official IFBench test set
+# APA evaluation on official IFBench test set  (parallel workers)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def eval_apa_on_ifbench(
@@ -198,35 +193,52 @@ def eval_apa_on_ifbench(
     llm:       object,
     examples:  List[IFBenchOfficialExample],
     scorer:    IFBenchOfficialScorer,
-    desc:      str = "APA eval",
+    desc:      str  = "APA eval",
+    workers:   int  = 4,
     verbose:   bool = False,
 ) -> Dict[str, float]:
     """
-    Run APA automaton on official IFBench test examples.
+    Run APA automaton on official IFBench test examples with parallel workers.
     Returns dict with prompt_loose, instruction_loose, n.
     """
     extractor = FeatureExtractor()
-    executor  = AutomatonExecutor(
-        automaton         = automaton,
-        llm_api           = llm,
-        feature_extractor = extractor,
-    )
-    prompt_loose_scores   = []
-    instruction_loose_scores = []
 
-    bar = tqdm(examples, desc=f"  {desc}", colour="cyan", leave=False)
-    for ex in bar:
-        episode  = executor.run_episode(ex.prompt, verbose=verbose)
+    def _eval_one(ex: IFBenchOfficialExample):
+        # Each thread gets its own executor instance (thread-safe: no shared
+        # mutable state; automaton / llm / feature_extractor are read-only)
+        _exec = AutomatonExecutor(
+            automaton         = automaton,
+            llm_api           = llm,
+            feature_extractor = extractor,
+        )
+        episode  = _exec.run_episode(ex.prompt, verbose=False)
         response = episode.final_output or ""
         pl = scorer.prompt_loose(example=ex, response=response)
         il = scorer.instruction_loose(example=ex, response=response)
-        prompt_loose_scores.append(pl)
-        instruction_loose_scores.append(il)
-        if verbose:
-            console.print(
-                f"  [dim]{ex.key}[/dim] pl={pl:.1f} il={il:.2f} "
-                f"[dim]{ex.instruction_id_list}[/dim]"
-            )
+        return ex.key, pl, il
+
+    prompt_loose_scores      = []
+    instruction_loose_scores = []
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(_eval_one, ex): ex for ex in examples}
+        bar = tqdm(
+            as_completed(futures),
+            total  = len(examples),
+            desc   = f"  {desc}",
+            colour = "cyan",
+            leave  = False,
+        )
+        for fut in bar:
+            key, pl, il = fut.result()
+            prompt_loose_scores.append(pl)
+            instruction_loose_scores.append(il)
+            if verbose:
+                ex = futures[fut]
+                console.print(
+                    f"  [dim]{key}[/dim] pl={pl:.1f} il={il:.2f} "
+                    f"[dim]{ex.instruction_id_list}[/dim]"
+                )
 
     n = len(examples)
     return {
@@ -237,7 +249,7 @@ def eval_apa_on_ifbench(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# GEPA / MIPRO evaluation on official IFBench test set
+# GEPA / MIPRO evaluation on official IFBench test set  (parallel workers)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def eval_dspy_program_on_ifbench(
@@ -247,29 +259,28 @@ def eval_dspy_program_on_ifbench(
     scorer:   IFBenchOfficialScorer,
     desc:     str  = "DSPy eval",
     colour:   str  = "magenta",
+    workers:  int  = 4,
     verbose:  bool = False,
 ) -> Dict[str, float]:
     """
     Run a compiled IFBenchRewriterProgram on official IFBench test examples.
-    Uses 2-stage pipeline: stage-1 draft → stage-2 optimised rewrite.
+    Stage-1 drafts are generated in parallel; stage-2 inference is also
+    parallelised with ThreadPoolExecutor(workers).
     """
-    from adaptive_prompt_automaton.search.gepa_dspy import generate_stage1_drafts
-
-    console.print(f"  [dim]Stage 1 drafts for {len(examples)} examples …[/dim]")
-    drafts = generate_stage1_drafts(examples, dspy_lm)
+    console.print(
+        f"  [dim]Stage 1 drafts for {len(examples)} examples "
+        f"(workers={workers}) …[/dim]"
+    )
+    drafts = generate_stage1_drafts(examples, dspy_lm, workers=workers)
 
     prompt_loose_scores      = []
     instruction_loose_scores = []
 
-    bar = tqdm(
-        zip(examples, drafts),
-        total   = len(examples),
-        desc    = f"  {desc}",
-        colour  = colour,
-        leave   = False,
-    )
-    with dspy.context(lm=dspy_lm):
-        for ex, draft in bar:
+    # ensure DSPy global LM is set before threads inherit context
+    dspy.configure(lm=dspy_lm)
+
+    def _eval_one(ex: IFBenchOfficialExample, draft: str):
+        with dspy.context(lm=dspy_lm):
             try:
                 pred     = program(
                     prompt          = ex.prompt,
@@ -279,13 +290,30 @@ def eval_dspy_program_on_ifbench(
                 response = str(getattr(pred, "response", "") or "")
             except Exception:
                 response = ""
-            pl = scorer.prompt_loose(example=ex, response=response)
-            il = scorer.instruction_loose(example=ex, response=response)
+        pl = scorer.prompt_loose(example=ex, response=response)
+        il = scorer.instruction_loose(example=ex, response=response)
+        return ex.key, pl, il
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(_eval_one, ex, draft): ex
+            for ex, draft in zip(examples, drafts)
+        }
+        bar = tqdm(
+            as_completed(futures),
+            total  = len(examples),
+            desc   = f"  {desc}",
+            colour = colour,
+            leave  = False,
+        )
+        for fut in bar:
+            key, pl, il = fut.result()
             prompt_loose_scores.append(pl)
             instruction_loose_scores.append(il)
             if verbose:
+                ex = futures[fut]
                 console.print(
-                    f"  [dim]{ex.key}[/dim] pl={pl:.1f} il={il:.2f} "
+                    f"  [dim]{key}[/dim] pl={pl:.1f} il={il:.2f} "
                     f"[dim]{ex.instruction_id_list}[/dim]"
                 )
 
@@ -306,32 +334,31 @@ def render_results_table(
     title:   str = "IFBench Results — Official Test Set (prompt_loose)",
 ) -> None:
     tbl = Table(
-        title      = title,
-        box        = box.DOUBLE_EDGE,
-        show_lines = True,
+        title        = title,
+        box          = box.DOUBLE_EDGE,
+        show_lines   = True,
         header_style = "bold white",
     )
-    tbl.add_column("Method",           style="bold",       width=26)
-    tbl.add_column("Prompt Loose ↑",   style="cyan",       justify="center", width=16)
-    tbl.add_column("Instr. Loose ↑",   style="green",      justify="center", width=16)
-    tbl.add_column("N",                style="dim",        justify="center", width=6)
+    tbl.add_column("Method",          style="bold",  width=26)
+    tbl.add_column("Prompt Loose ↑",  style="cyan",  justify="center", width=16)
+    tbl.add_column("Instr. Loose ↑",  style="green", justify="center", width=16)
+    tbl.add_column("N",               style="dim",   justify="center", width=6)
 
     method_styles = {"APA": "cyan", "GEPA": "yellow", "MIPRO": "magenta"}
-
     best_pl = max((v["prompt_loose"] for v in results.values()), default=0.0)
 
     for method, metrics in results.items():
-        pl = metrics.get("prompt_loose", 0.0)
-        il = metrics.get("instruction_loose", 0.0)
-        n  = int(metrics.get("n", 0))
+        pl    = metrics.get("prompt_loose", 0.0)
+        il    = metrics.get("instruction_loose", 0.0)
+        n     = int(metrics.get("n", 0))
         style = method_styles.get(method, "white")
-
-        pl_str = f"[bold green]{pl*100:.1f}%[/bold green]" if pl == best_pl else f"{pl*100:.1f}%"
-        il_str = f"{il*100:.1f}%"
-
+        pl_str = (
+            f"[bold green]{pl*100:.1f}%[/bold green]"
+            if pl == best_pl else f"{pl*100:.1f}%"
+        )
         tbl.add_row(
             f"[{style}]{method}[/{style}]",
-            pl_str, il_str, str(n),
+            pl_str, f"{il*100:.1f}%", str(n),
         )
 
     console.print(tbl)
@@ -340,6 +367,160 @@ def render_results_table(
         "[dim]prompt_loose = fraction of prompts where ALL constraints pass (loose mode)\n"
         "instr._loose  = mean fraction of individual constraints that pass[/dim]"
     )
+
+
+def _print_partial(method: str, metrics: Dict[str, float], style: str = "white") -> None:
+    """Print a one-line result summary immediately after a method finishes."""
+    pl = metrics["prompt_loose"] * 100
+    il = metrics["instruction_loose"] * 100
+    console.print(
+        f"  [{style}]{method}[/{style}]  "
+        f"prompt_loose = [bold {style}]{pl:.1f}%[/bold {style}]  "
+        f"instr_loose = {il:.1f}%  "
+        f"[dim](n={int(metrics['n'])})[/dim]"
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Per-method train + eval  (called sequentially from main)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_apa(
+    args,
+    llm_apa,
+    train_examples: List[IFBenchOfficialExample],
+    test_examples:  List[IFBenchOfficialExample],
+    scorer:         IFBenchOfficialScorer,
+) -> Dict[str, float]:
+    """Train APA then evaluate on test set.  Returns metrics dict."""
+    console.print(Panel(
+        "[cyan bold]APA — Evolutionary FSA[/cyan bold]\n"
+        "[dim]Training then evaluating on official test set.[/dim]",
+        border_style="cyan",
+    ))
+
+    apa_tasks = _apa_train_tasks_from_ifbench(train_examples)
+    if not apa_tasks:
+        apa_tasks = [
+            Task(task_id=f"t{i}", input_text=f"Sample instruction-following task {i}.", expected="")
+            for i in range(20)
+        ]
+
+    extractor  = FeatureExtractor()
+    apa_search = EvolutionarySearch(
+        initial_automaton = build_apa_seed(),
+        llm_api           = llm_apa,
+        feature_extractor = extractor,
+        reward_fn         = composite_reward,
+        n_generations     = 8,
+        mutation_rate     = 0.40,
+        elite_frac        = 0.25,
+        tournament_size   = 3,
+        n_eval_tasks      = min(5, len(apa_tasks)),
+        seed              = SEED,
+    )
+    best_automaton = apa_search.run(
+        [t.input_text for t in apa_tasks], console=console
+    )
+    console.print(
+        f"  [green]✓[/green] APA trained  "
+        f"fitness=[cyan]{apa_search.best_fitness:.4f}[/cyan]"
+    )
+
+    console.rule("[cyan]APA — Test Evaluation[/cyan]")
+    metrics = eval_apa_on_ifbench(
+        automaton = best_automaton,
+        llm       = llm_apa,
+        examples  = test_examples,
+        scorer    = scorer,
+        desc      = "APA test",
+        workers   = getattr(args, "workers", 4),
+        verbose   = getattr(args, "verbose", False),
+    )
+    _print_partial("APA", metrics, "cyan")
+    return metrics
+
+
+def run_gepa(
+    args,
+    dspy_lm,
+    train_examples: List[IFBenchOfficialExample],
+    val_examples:   List[IFBenchOfficialExample],
+    test_examples:  List[IFBenchOfficialExample],
+    scorer:         IFBenchOfficialScorer,
+) -> tuple:
+    """Train GEPA then evaluate on test set.  Returns (metrics, gepa_search)."""
+    console.print(Panel(
+        "[yellow bold]GEPA — dspy.GEPA (official IFBench pipeline)[/yellow bold]\n"
+        "[dim]Training then evaluating on official test set.[/dim]",
+        border_style="yellow",
+    ))
+
+    gepa_search = GEPADSPySearch(
+        auto           = getattr(args, "gepa_auto", "light"),
+        ifbench_scorer = scorer,
+        train_examples = train_examples,
+        val_examples   = val_examples,
+        dspy_lm        = dspy_lm,
+        seed           = SEED,
+        workers        = getattr(args, "workers", 4),
+    )
+    trained_program = gepa_search.run(console=console)
+
+    console.rule("[yellow]GEPA — Test Evaluation[/yellow]")
+    metrics = eval_dspy_program_on_ifbench(
+        program  = trained_program,
+        dspy_lm  = dspy_lm,
+        examples = test_examples,
+        scorer   = scorer,
+        desc     = "GEPA test",
+        colour   = "yellow",
+        workers  = getattr(args, "workers", 4),
+        verbose  = getattr(args, "verbose", False),
+    )
+    _print_partial("GEPA", metrics, "yellow")
+    return metrics, gepa_search
+
+
+def run_mipro(
+    args,
+    dspy_lm,
+    train_examples: List[IFBenchOfficialExample],
+    val_examples:   List[IFBenchOfficialExample],
+    test_examples:  List[IFBenchOfficialExample],
+    scorer:         IFBenchOfficialScorer,
+) -> tuple:
+    """Train MIPRO then evaluate on test set.  Returns (metrics, mipro_search)."""
+    console.print(Panel(
+        "[magenta bold]MIPRO — dspy.MIPROv2 (official IFBench pipeline)[/magenta bold]\n"
+        "[dim]Training then evaluating on official test set.[/dim]",
+        border_style="magenta",
+    ))
+
+    mipro_search = MIPRODSPySearch(
+        auto           = getattr(args, "mipro_auto", "light"),
+        ifbench_scorer = scorer,
+        train_examples = train_examples,
+        val_examples   = val_examples,
+        dspy_lm        = dspy_lm,
+        seed           = SEED,
+        workers        = getattr(args, "workers", 4),
+    )
+    trained_program = mipro_search.run(console=console)
+
+    console.rule("[magenta]MIPRO — Test Evaluation[/magenta]")
+    metrics = eval_dspy_program_on_ifbench(
+        program  = trained_program,
+        dspy_lm  = dspy_lm,
+        examples = test_examples,
+        scorer   = scorer,
+        desc     = "MIPRO test",
+        colour   = "magenta",
+        workers  = getattr(args, "workers", 4),
+        verbose  = getattr(args, "verbose", False),
+    )
+    _print_partial("MIPRO", metrics, "magenta")
+    return metrics, mipro_search
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -352,7 +533,7 @@ def main(args: argparse.Namespace) -> None:
     api_key    = getattr(args, "api_key", None)
     train_size = getattr(args, "train_size", 300)
     val_size   = getattr(args, "val_size", 100)
-    verbose    = getattr(args, "verbose", False)
+    workers    = getattr(args, "workers", 4)
     methods    = [m.lower() for m in args.methods]
 
     # ── Banner ─────────────────────────────────────────────────────────────
@@ -360,36 +541,39 @@ def main(args: argparse.Namespace) -> None:
         f"[bold green]{model}[/bold green]" if model != "mock"
         else "[dim]MockLLM[/dim]"
     )
-    _gepa_tag  = "[green]dspy.GEPA (official)[/green]"   if _HAS_DSPY else "[red]DSPy not installed[/red]"
+    _gepa_tag  = "[green]dspy.GEPA (official)[/green]"    if _HAS_DSPY else "[red]DSPy not installed[/red]"
     _mipro_tag = "[green]dspy.MIPROv2 (official)[/green]" if _HAS_DSPY else "[red]DSPy not installed[/red]"
 
     console.print(Panel.fit(
         "[bold bright_white]IFBench Official Evaluation[/bold bright_white]\n\n"
-        "[dim]Each method works exactly as in its respective paper.[/dim]\n\n"
+        "[dim]Each method works exactly as in its respective paper.\n"
+        "Methods run sequentially — each finishes train + eval before the next starts.[/dim]\n\n"
         "  [cyan bold]APA[/cyan bold]    — 4-state FSA, evolutionary search (unchanged)\n"
         f"  [yellow bold]GEPA[/yellow bold]   — IFBench 2-stage rewriter  [{_gepa_tag}]\n"
         f"  [magenta bold]MIPRO[/magenta bold]  — IFBench 2-stage rewriter  [{_mipro_tag}]\n\n"
         f"  Model    : {_model_tag}\n"
         f"  Methods  : [green]{', '.join(methods)}[/green]\n"
+        f"  Workers  : [green]{workers}[/green] (parallel LLM calls per eval pass)\n"
         f"  Train    : [green]{train_size}[/green]  Val: [green]{val_size}[/green]  "
         f"Test: [green]300[/green] (official IFBench)",
         title="[bold]IFBench — APA vs GEPA vs MIPRO[/bold]",
         border_style="white",
     ))
 
-    # ── Set up LLMs ────────────────────────────────────────────────────────
+    # ── Validate API key ───────────────────────────────────────────────────
     key = api_key or os.environ.get("OPENAI_API_KEY", "")
     if model != "mock" and not key:
         console.print("[red]Error:[/red] OPENAI_API_KEY is required for live models.")
         console.print("Set it with:  export OPENAI_API_KEY=sk-...")
         sys.exit(1)
 
+    # ── Set up LLMs ────────────────────────────────────────────────────────
     if model != "mock":
-        llm_apa  = get_llm_api("openai", model=model, api_key=key)
-        dspy_lm  = dspy.LM(f"openai/{model}", api_key=key) if _HAS_DSPY else None
+        llm_apa = get_llm_api("openai", model=model, api_key=key)
+        dspy_lm = dspy.LM(f"openai/{model}", api_key=key) if _HAS_DSPY else None
     else:
-        llm_apa  = get_llm_api("mock", uncertainty_rate=0.32, latency=0.0, seed=SEED)
-        dspy_lm  = None
+        llm_apa = get_llm_api("mock", uncertainty_rate=0.32, latency=0.0, seed=SEED)
+        dspy_lm = None
 
     # ── Load official IFBench data ─────────────────────────────────────────
     scorer = IFBenchOfficialScorer()
@@ -402,7 +586,8 @@ def main(args: argparse.Namespace) -> None:
     train_examples: List[IFBenchOfficialExample] = []
     val_examples:   List[IFBenchOfficialExample] = []
 
-    if ("gepa" in methods or "mipro" in methods) and model != "mock":
+    need_hf = ("gepa" in methods or "mipro" in methods) and model != "mock"
+    if need_hf:
         console.print(f"  [dim]Loading IF-RLVR train/val from HuggingFace …[/dim]")
         try:
             train_examples, val_examples = load_ifbench_train_val(
@@ -425,144 +610,46 @@ def main(args: argparse.Namespace) -> None:
         )
         methods = [m for m in methods if m == "apa"]
 
-    # ── Train each method ─────────────────────────────────────────────────
-    trained: Dict[str, object] = {}   # method → automaton or dspy.Module
+    # ── Run each method sequentially: train then eval before moving on ─────
+    results:        Dict[str, Dict[str, float]] = {}
+    gepa_search_obj  = None
+    mipro_search_obj = None
 
-    # APA: evolutionary FSA (unchanged)
-    if "apa" in methods:
-        console.print(Panel(
-            "[cyan bold]Training APA — Evolutionary FSA[/cyan bold]",
-            border_style="cyan",
-        ))
-        # For APA training, use IFBench train examples (or subset) as tasks
-        apa_tasks = _apa_train_tasks_from_ifbench(
-            train_examples[:train_size] if train_examples else []
-        )
-        if not apa_tasks:
-            # Mock mode: use a small synthetic task set for training
-            apa_tasks = [
-                Task(task_id=f"t{i}", input_text=f"Sample instruction-following task {i}.", expected="")
-                for i in range(20)
-            ]
+    console.rule("[bold white]Starting Evaluation — Sequential Method Pipeline[/bold white]")
 
-        extractor  = FeatureExtractor()
-        apa_search = EvolutionarySearch(
-            initial_automaton = build_apa_seed(),
-            llm_api           = llm_apa,
-            feature_extractor = extractor,
-            reward_fn         = composite_reward,
-            n_generations     = 8,
-            mutation_rate     = 0.40,
-            elite_frac        = 0.25,
-            tournament_size   = 3,
-            n_eval_tasks      = min(5, len(apa_tasks)),
-            seed              = SEED,
-        )
-        trained["apa"] = apa_search.run(
-            [t.input_text for t in apa_tasks], console=console
-        )
-        console.print(
-            f"  [green]✓[/green] APA trained  "
-            f"fitness={apa_search.best_fitness:.4f}"
-        )
+    for method in methods:
+        console.rule()
 
-    # GEPA: official dspy.GEPA with IFBench 2-stage pipeline
-    if "gepa" in methods:
-        console.print(Panel(
-            "[yellow bold]Training GEPA — dspy.GEPA (official IFBench pipeline)[/yellow bold]",
-            border_style="yellow",
-        ))
-        gepa_search = GEPADSPySearch(
-            auto           = getattr(args, "gepa_auto", "light"),
-            ifbench_scorer = scorer,
-            train_examples = train_examples,
-            val_examples   = val_examples,
-            dspy_lm        = dspy_lm,
-            seed           = SEED,
-        )
-        trained["gepa"] = gepa_search.run(console=console)
+        if method == "apa":
+            results["APA"] = run_apa(
+                args, llm_apa, train_examples, test_examples, scorer
+            )
 
-    # MIPRO: official dspy.MIPROv2 with IFBench 2-stage pipeline
-    if "mipro" in methods:
-        console.print(Panel(
-            "[magenta bold]Training MIPRO — dspy.MIPROv2 (official IFBench pipeline)[/magenta bold]",
-            border_style="magenta",
-        ))
-        mipro_search = MIPRODSPySearch(
-            auto           = getattr(args, "mipro_auto", "light"),
-            ifbench_scorer = scorer,
-            train_examples = train_examples,
-            val_examples   = val_examples,
-            dspy_lm        = dspy_lm,
-            seed           = SEED,
-        )
-        trained["mipro"] = mipro_search.run(console=console)
+        elif method == "gepa":
+            results["GEPA"], gepa_search_obj = run_gepa(
+                args, dspy_lm, train_examples, val_examples, test_examples, scorer
+            )
 
-    # ── Evaluate on official test set ──────────────────────────────────────
-    console.print(Rule("[bold]Official IFBench Test Evaluation (300 prompts)[/bold]"))
-    results: Dict[str, Dict[str, float]] = {}
+        elif method == "mipro":
+            results["MIPRO"], mipro_search_obj = run_mipro(
+                args, dspy_lm, train_examples, val_examples, test_examples, scorer
+            )
 
-    if "apa" in trained:
-        console.print(Panel("[cyan bold]Evaluating APA on official test set[/cyan bold]", border_style="cyan"))
-        results["APA"] = eval_apa_on_ifbench(
-            automaton = trained["apa"],
-            llm       = llm_apa,
-            examples  = test_examples,
-            scorer    = scorer,
-            desc      = "APA test",
-            verbose   = verbose,
-        )
-        console.print(
-            f"  APA  prompt_loose = [bold cyan]{results['APA']['prompt_loose']*100:.1f}%[/bold cyan]  "
-            f"instr_loose = {results['APA']['instruction_loose']*100:.1f}%"
-        )
-
-    if "gepa" in trained:
-        console.print(Panel("[yellow bold]Evaluating GEPA on official test set[/yellow bold]", border_style="yellow"))
-        results["GEPA"] = eval_dspy_program_on_ifbench(
-            program  = trained["gepa"],
-            dspy_lm  = dspy_lm,
-            examples = test_examples,
-            scorer   = scorer,
-            desc     = "GEPA test",
-            colour   = "yellow",
-            verbose  = verbose,
-        )
-        console.print(
-            f"  GEPA prompt_loose = [bold yellow]{results['GEPA']['prompt_loose']*100:.1f}%[/bold yellow]  "
-            f"instr_loose = {results['GEPA']['instruction_loose']*100:.1f}%"
-        )
-
-    if "mipro" in trained:
-        console.print(Panel("[magenta bold]Evaluating MIPRO on official test set[/magenta bold]", border_style="magenta"))
-        results["MIPRO"] = eval_dspy_program_on_ifbench(
-            program  = trained["mipro"],
-            dspy_lm  = dspy_lm,
-            examples = test_examples,
-            scorer   = scorer,
-            desc     = "MIPRO test",
-            colour   = "magenta",
-            verbose  = verbose,
-        )
-        console.print(
-            f"  MIPRO prompt_loose = [bold magenta]{results['MIPRO']['prompt_loose']*100:.1f}%[/bold magenta]  "
-            f"instr_loose = {results['MIPRO']['instruction_loose']*100:.1f}%"
-        )
-
-    # ── Final table ────────────────────────────────────────────────────────
+    # ── Final comparison table ─────────────────────────────────────────────
     console.print()
+    console.rule("[bold white]Final Results[/bold white]")
     render_results_table(results)
 
-    # Print optimised instructions for GEPA/MIPRO
-    if "gepa" in methods and "gepa" in trained:
-        instr = gepa_search.get_optimised_instruction()
+    # ── Print optimised instructions (GEPA / MIPRO) ────────────────────────
+    if gepa_search_obj is not None:
+        instr = gepa_search_obj.get_optimised_instruction()
         console.print(Panel(
             f"[dim]{instr}[/dim]",
             title="[yellow]GEPA — Evolved Stage-2 Instruction[/yellow]",
             border_style="yellow",
         ))
-    if "mipro" in methods and "mipro" in trained:
-        instr = mipro_search.get_optimised_instruction()
+    if mipro_search_obj is not None:
+        instr = mipro_search_obj.get_optimised_instruction()
         console.print(Panel(
             f"[dim]{instr}[/dim]",
             title="[magenta]MIPRO — Optimised Stage-2 Instruction[/magenta]",
@@ -584,8 +671,8 @@ Examples
   # APA only (mock, offline)
   python ifbench_eval.py --methods apa
 
-  # All methods (live model, default 300 train / 100 val)
-  python ifbench_eval.py --model gpt-4.1-mini
+  # All methods, 8 parallel workers
+  python ifbench_eval.py --model gpt-4.1-mini --workers 8
 
   # Custom split sizes
   python ifbench_eval.py --model gpt-4.1-mini --train-size 200 --val-size 100
@@ -603,6 +690,11 @@ Metrics
 ───────
   Primary : prompt_loose  — 1.0 if ALL constraints pass (loose), else 0.0
   Secondary: instruction_loose — mean fraction of individual constraints passing
+
+Sequential execution
+────────────────────
+  Each method runs to completion (train → eval) before the next begins.
+  Within each eval pass, LLM calls are parallelised via --workers.
         """,
     )
     p.add_argument(
@@ -629,6 +721,10 @@ Metrics
     p.add_argument(
         "--val-size", dest="val_size", type=int, default=100,
         help="IF-RLVR val samples for GEPA/MIPRO (default: 100)",
+    )
+    p.add_argument(
+        "--workers", type=int, default=4,
+        help="Parallel LLM workers for eval passes (default: 4)",
     )
     p.add_argument(
         "--gepa-auto", dest="gepa_auto", default="light",
