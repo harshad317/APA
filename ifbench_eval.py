@@ -223,22 +223,19 @@ def build_apa_seed() -> Automaton:
         ),
     }
     transitions = [
-        # Route through decompose when the initial answer is uncertain (confidence
-        # < 0.80 means the model used hedging language).  This guard fires on LLM
-        # *output* features, not on static input length, so routing varies across
-        # episodes and PathEntropy stays > 0.
+        # IFBench tasks ALWAYS benefit from constraint decomposition — every prompt
+        # contains multiple explicit constraints (format, length, keyword, exclusion,
+        # etc.) that the model must enumerate and satisfy.  Routing start→decompose
+        # unconditionally guarantees the full 4-state pipeline runs on every episode.
         #
-        # Previous guard was `input_length > 0.12` (priority 2), which fired for
-        # every IFBench prompt (all > 60 words) → every episode took the same
-        # start→decompose→verify→terminal path → PathEntropy = 0.000 forever.
+        # Previous attempt: `answer_confidence < 0.80` (threshold guard). gpt-4.1-mini
+        # is highly confident on all IFBench tasks and almost never produces hedging
+        # language, so this guard fired ~0% of the time → decompose was skipped →
+        # effective pipeline degraded to 3 states (start→verify→terminal) →
+        # constraint-audit step lost → scores dropped from 31.3% to 20.3%.
         TransitionConfig(
             source_state="start", target_state="decompose",
-            guard_type="threshold", feature_name="answer_confidence",
-            operator="<", threshold=0.80, priority=2,
-        ),
-        TransitionConfig(
-            source_state="start", target_state="verify",
-            guard_type="always", operator="always", priority=1,
+            guard_type="always", operator="always", priority=2,
         ),
         TransitionConfig(
             source_state="decompose", target_state="verify",
@@ -391,11 +388,34 @@ def _make_ifbench_episode_reward(
     examples: List[IFBenchOfficialExample],
 ) -> Callable[[Episode], float]:
     """
-    Reward APA training with the same official IFBench verifier used at test time.
+    Reward APA training with a blend of the official IFBench verifier and the
+    composite proxy reward.
 
-    prompt_loose is binary and sparse, so instruction_loose supplies partial credit
-    when only some constraints pass. A small composite_reward tie-breaker keeps
-    malformed/empty outputs below useful outputs when verifier scores tie.
+    Blending rationale
+    ──────────────────
+    Pure official-verifier training on 5 probe tasks produces fitness ~0.02–0.04
+    for all individuals because most responses fail hard IFBench constraints
+    outright (binary prompt_score=0, instr_score≈0.08).  The evolutionary search
+    cannot distinguish templates at that resolution — it converges to a flat
+    fitness landscape and stops improving.
+
+    composite_reward provides a smooth, informative signal (word count, terminal
+    punctuation, no hedging) that correlates with IFBench success: longer,
+    structured, confident responses are more likely to satisfy format/length/
+    style constraints.  Giving it 35% weight acts as a curriculum warm-up —
+    templates that produce good-quality outputs rise in the population early,
+    giving the official verifier signal (65%) more to work with.
+
+    Weights
+    ───────
+      0.50 × prompt_score    — primary: all constraints fully satisfied (binary)
+      0.15 × instr_score     — partial credit: fraction of constraints satisfied
+      0.35 × composite       — smooth baseline: output quality proxy
+
+    For a response that fails all constraints but is well-formed:
+      reward ≈ 0 + 0 + 0.35×0.6 ≈ 0.21   (was 0.03 with 0.05 weight)
+    For a response that passes all constraints:
+      reward ≈ 0.50 + 0.15 + 0.35×0.8 ≈ 0.93
     """
     by_prompt = {ex.prompt: ex for ex in examples}
 
@@ -404,12 +424,12 @@ def _make_ifbench_episode_reward(
         if ex is None:
             return composite_reward(episode)
 
-        response = episode.final_output or ""
-        passed = scorer.per_instruction(ex, response)
-        instr_score = sum(passed) / len(passed) if passed else 0.0
+        response    = episode.final_output or ""
+        passed      = scorer.per_instruction(ex, response)
+        instr_score  = sum(passed) / len(passed) if passed else 0.0
         prompt_score = 1.0 if passed and all(passed) else 0.0
-        tie_break = max(0.0, composite_reward(episode)) * 0.05
-        return min(1.0, 0.80 * prompt_score + 0.15 * instr_score + tie_break)
+        proxy        = max(0.0, composite_reward(episode))
+        return min(1.0, 0.50 * prompt_score + 0.15 * instr_score + 0.35 * proxy)
 
     return reward
 
