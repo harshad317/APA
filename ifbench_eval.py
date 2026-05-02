@@ -624,6 +624,8 @@ def run_apa(
         diversity_lambda     = 0.10,
         diversity_threshold  = 0.15,
         diversity_quota      = 1,
+        # Parallelism — now active during training (was only in eval before)
+        workers              = getattr(args, "workers", 1),
     )
     best_automaton = apa_search.run(
         [t.input_text for t in apa_tasks], console=console

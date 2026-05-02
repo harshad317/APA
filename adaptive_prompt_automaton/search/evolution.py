@@ -46,6 +46,8 @@ import math
 import random
 from typing import Callable, Dict, List, Optional, Any
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 from tqdm import tqdm
 from rich.console import Console
 from rich.panel import Panel
@@ -439,6 +441,10 @@ class EvolutionarySearch:
         diversity_lambda:    float = 0.10,
         diversity_threshold: float = 0.15,
         diversity_quota:     int   = 1,
+        # Parallelism — number of individuals evaluated concurrently during training.
+        # Probe-task evaluation within a single individual remains sequential;
+        # population-level parallelism is embarrassingly parallel (no shared state).
+        workers:             int   = 1,
     ):
         self.template_automaton  = initial_automaton
         self.llm                 = llm_api
@@ -462,6 +468,8 @@ class EvolutionarySearch:
         self.diversity_quota     = diversity_quota
         # Fingerprinting active only when both probe_tasks and fingerprint_fn given
         self._fingerprinting     = (probe_tasks is not None and fingerprint_fn is not None)
+        # Parallelism
+        self.workers             = max(1, workers)
 
         # Diagnostics
         self.history:        List[Dict[str, Any]] = []
@@ -512,7 +520,12 @@ class EvolutionarySearch:
     # Evaluation  (Fixes 2, 4, 5 — fixed probe set, zero-cost fingerprints)
     # ──────────────────────────────────────────────────────────────────────────
 
-    def _evaluate(self, automaton: Automaton, tasks: List[str]) -> float:
+    def _evaluate(
+        self,
+        automaton: Automaton,
+        tasks:     List[str],
+        _sample:   Optional[List[str]] = None,
+    ) -> float:
         """
         Evaluate an automaton on the probe set and, if fingerprinting is active,
         record its behavioral fingerprint at zero additional API cost.
@@ -524,12 +537,17 @@ class EvolutionarySearch:
                those in gen 8.
         Fix 5: fingerprint values are derived from the same episodes already run
                for fitness, so fingerprinting adds zero extra LLM calls.
+
+        _sample: pre-computed task list (used by _evaluate_batch to keep
+                 random sampling in the main thread — thread-safe RNG).
         """
         executor = AutomatonExecutor(automaton, self.llm, self.extractor)
 
-        # Fixed probe set (Fixes 2 & 4) or random sample (backward-compat fallback)
+        # Fixed probe set (Fixes 2 & 4), pre-computed sample, or inline random sample
         if self._fingerprinting and self.probe_tasks:
             sample = self.probe_tasks          # always the same fixed set
+        elif _sample is not None:
+            sample = _sample                   # pre-computed by caller (thread-safe)
         else:
             sample = self.rng.sample(tasks, min(self.n_eval_tasks, len(tasks)))
 
@@ -553,6 +571,64 @@ class EvolutionarySearch:
             automaton.fingerprint = fingerprint     # stored for diversity selection
 
         return fitness
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Parallel batch evaluation
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _evaluate_batch(
+        self,
+        individuals: List[Automaton],
+        tasks:       List[str],
+        desc:        str = "Eval",
+        colour:      str = "cyan",
+    ) -> None:
+        """
+        Evaluate a list of individuals, in parallel when self.workers > 1.
+
+        Thread-safety design:
+          - Each individual has its own Automaton instance — no shared mutable state
+            between threads at the individual level.
+          - When probe_tasks is set (fingerprinting mode): _evaluate() uses the
+            fixed probe_tasks list — self.rng is never called inside _evaluate(),
+            so there is no RNG race condition.
+          - When probe_tasks is NOT set (random-sample fallback): all random samples
+            are generated here in the main thread BEFORE dispatching to the pool,
+            then passed as _sample to each worker.  self.rng is never called from
+            worker threads.
+          - The LLM wrappers (MockLLM / OpenAILLM) both use Lock-protected counters
+            and the openai client is thread-safe for concurrent requests.
+        """
+        if self.workers <= 1 or len(individuals) <= 1:
+            # Sequential path (default / single-worker)
+            for aut in tqdm(individuals, desc=f"  {desc}", colour=colour, leave=True):
+                self._evaluate(aut, tasks)
+            return
+
+        # Pre-compute random samples in main thread when not using fixed probe set
+        # (keeps self.rng single-threaded — thread-safe)
+        if self._fingerprinting and self.probe_tasks:
+            samples: List[Optional[List[str]]] = [None] * len(individuals)
+        else:
+            samples = [
+                self.rng.sample(tasks, min(self.n_eval_tasks, len(tasks)))
+                for _ in individuals
+            ]
+
+        with ThreadPoolExecutor(max_workers=self.workers) as pool:
+            futures = {
+                pool.submit(self._evaluate, aut, tasks, smp): aut
+                for aut, smp in zip(individuals, samples)
+            }
+            bar = tqdm(
+                as_completed(futures),
+                total  = len(individuals),
+                desc   = f"  {desc}",
+                colour = colour,
+                leave  = True,
+            )
+            for fut in bar:
+                fut.result()   # re-raise any exception from worker
 
     # ──────────────────────────────────────────────────────────────────────────
     # Tournament selection (unchanged)
@@ -724,6 +800,7 @@ class EvolutionarySearch:
             f"  Tasks per eval       : [green]{n_probe}[/green]"
             f"  {'(fixed probe set)' if self.probe_tasks else '(random sample)'}\n"
             f"  Training tasks       : [green]{len(train_tasks)}[/green]\n"
+            f"  Workers (training)   : [green]{self.workers}[/green]\n"
             f"  Fingerprinting       : {fp_status}\n"
             f"  Diversity λ (bonus)  : [green]{self.diversity_lambda}[/green]\n"
             f"  Cluster threshold    : [green]{self.diversity_threshold}[/green]\n"
@@ -737,8 +814,7 @@ class EvolutionarySearch:
         population = self._init_population()
 
         console.print("[yellow]Evaluating initial population…[/yellow]")
-        for aut in tqdm(population, desc="  Init Eval", colour="cyan", leave=True):
-            self._evaluate(aut, train_tasks)
+        self._evaluate_batch(population, train_tasks, desc="Init Eval", colour="cyan")
 
         # ── Generational loop ──────────────────────────────────────────────
         gen_bar = tqdm(range(self.n_generations), desc="  Generations", colour="green")
@@ -788,15 +864,13 @@ class EvolutionarySearch:
                     child  = mutate(parent, self.mutation_rate, rng=self.rng)
                 new_pop.append(child)
 
-            # Evaluate only the new (non-elite) individuals
+            # Evaluate only the new (non-elite) individuals — in parallel
             to_eval = new_pop[len(elite):]
-            for aut in tqdm(
-                to_eval,
-                desc=f"  Gen {gen + 1:02d} Eval",
+            self._evaluate_batch(
+                to_eval, train_tasks,
+                desc=f"Gen {gen + 1:02d} Eval",
                 colour="yellow",
-                leave=False,
-            ):
-                self._evaluate(aut, train_tasks)
+            )
 
             population = new_pop
 
