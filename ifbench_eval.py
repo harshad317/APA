@@ -124,6 +124,62 @@ def _counter_count(counter: object) -> int:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Fallback probe tasks + proxy fingerprint
+# Used when HuggingFace `datasets` is unavailable and train_examples is empty.
+# These hardcoded prompts cover the major IFBench constraint categories
+# (keyword inclusion, exact word-count, format/list, sentence structure,
+#  enumeration, style, brevity, multi-attribute) so the fingerprint vector
+# discriminates behaviourally distinct FSA variants even without real data.
+# ══════════════════════════════════════════════════════════════════════════════
+
+_FALLBACK_PROBE_TASKS: List[str] = [
+    # keyword inclusion
+    "Write a haiku about space exploration. It must contain the word 'cosmos'.",
+    # exact word-count constraint
+    "In exactly 50 words, describe the water cycle. Do not use the word 'rain'.",
+    # enumeration + capitalisation
+    "List exactly 3 benefits of regular exercise. Each item must start with a capital letter.",
+    # sentence-count + punctuation
+    "Write a two-sentence explanation of photosynthesis. End each sentence with a period.",
+    # adjective count + format
+    "Describe a sunset using exactly 5 adjectives. Present them as a numbered list.",
+    # structure (setup/punchline)
+    "Write a joke about programming. It must have a clearly labelled setup and punchline.",
+    # brevity constraint + register
+    "In fewer than 30 words, explain why the sky is blue. Use simple everyday language.",
+    # multi-attribute product description
+    "Write a product description for a pencil. It must mention its color, length, and primary use.",
+]
+
+
+def _make_proxy_fingerprint_fn() -> Callable[[str, str], float]:
+    """
+    Path-independent quality fingerprint used when no official IFBench scorer
+    is available (e.g., ``datasets`` not installed).
+
+    Returns 1.0 when the response is substantive (10–200 words), ends with
+    terminal punctuation, and contains no hedging language; 0.0 otherwise.
+    The signal is completely independent of the FSA routing path taken, so it
+    cannot reward routing artefacts — only output quality.
+    """
+    _HEDGE_PHRASES = (
+        "not sure", "uncertain", "possibly", "perhaps",
+        "i don't know", "i'm not certain", "i cannot be sure",
+        "it depends", "i'm unsure",
+    )
+
+    def fingerprint_fn(task_input: str, response: str) -> float:
+        words   = response.split()
+        lower   = response.lower()
+        hedge   = any(ph in lower for ph in _HEDGE_PHRASES)
+        length_ok = 10 <= len(words) <= 200
+        ends_ok   = response.rstrip().endswith((".", "!", "?"))
+        return float(length_ok and ends_ok and not hedge)
+
+    return fingerprint_fn
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # APA seed automaton (4-state FSA, unchanged)
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -167,10 +223,18 @@ def build_apa_seed() -> Automaton:
         ),
     }
     transitions = [
+        # Route through decompose when the initial answer is uncertain (confidence
+        # < 0.80 means the model used hedging language).  This guard fires on LLM
+        # *output* features, not on static input length, so routing varies across
+        # episodes and PathEntropy stays > 0.
+        #
+        # Previous guard was `input_length > 0.12` (priority 2), which fired for
+        # every IFBench prompt (all > 60 words) → every episode took the same
+        # start→decompose→verify→terminal path → PathEntropy = 0.000 forever.
         TransitionConfig(
             source_state="start", target_state="decompose",
-            guard_type="threshold", feature_name="input_length",
-            operator=">", threshold=0.12, priority=2,
+            guard_type="threshold", feature_name="answer_confidence",
+            operator="<", threshold=0.80, priority=2,
         ),
         TransitionConfig(
             source_state="start", target_state="verify",
@@ -606,6 +670,25 @@ def run_apa(
         )
 
     probe_task_inputs = [ex.prompt for ex in probe_examples] if probe_examples else None
+
+    # ── Fallback fingerprinting when no HuggingFace train data ───────────────
+    # When datasets is not installed, probe_pool is empty → probe_examples is
+    # empty → probe_task_inputs is None and fp_fn is None → EvolutionarySearch
+    # would print "Fingerprinting: disabled" and skip all diversity mechanics.
+    #
+    # Instead: activate fingerprinting with 8 hardcoded IFBench-style tasks and
+    # a path-independent proxy quality signal.  This is weaker than the official
+    # IFBench verifier but still provides meaningful diversity pressure and keeps
+    # the panel from misreporting "disabled".
+    if probe_task_inputs is None:
+        probe_task_inputs = _FALLBACK_PROBE_TASKS
+        fp_fn             = _make_proxy_fingerprint_fn()
+        console.print(
+            f"  [yellow]⚠[/yellow]  No HuggingFace train data — "
+            f"activating fallback fingerprinting "
+            f"({len(_FALLBACK_PROBE_TASKS)} hardcoded proxy tasks, proxy quality signal).\n"
+            f"  Install [cyan]datasets[/cyan] for official IFBench fingerprinting."
+        )
 
     apa_search = EvolutionarySearch(
         initial_automaton    = build_apa_seed(),
