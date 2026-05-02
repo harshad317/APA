@@ -1,1 +1,0 @@
-"""Olympiad scoring helpers."""

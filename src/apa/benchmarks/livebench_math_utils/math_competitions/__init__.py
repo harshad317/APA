@@ -1,1 +1,0 @@
-"""Math competition scoring helpers."""

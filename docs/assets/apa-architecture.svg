@@ -1,0 +1,104 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="560" viewBox="0 0 1120 560" role="img" aria-labelledby="title desc">
+  <title id="title">Adaptive Prompt Automaton architecture</title>
+  <desc id="desc">A layered architecture diagram showing tasks entering an automaton runtime, routing through states, feature extraction, guarded transitions, optimization, and evaluation.</desc>
+  <defs>
+    <style>
+      .bg { fill: #f8fafc; }
+      .panel { fill: #ffffff; stroke: #cbd5e1; stroke-width: 2; rx: 14; }
+      .card { fill: #ffffff; stroke: #64748b; stroke-width: 1.7; rx: 12; }
+      .accent1 { fill: #e0f2fe; stroke: #0284c7; }
+      .accent2 { fill: #ecfdf5; stroke: #059669; }
+      .accent3 { fill: #fff7ed; stroke: #ea580c; }
+      .accent4 { fill: #fef2f2; stroke: #dc2626; }
+      .accent5 { fill: #f5f3ff; stroke: #7c3aed; }
+      .text { font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0f172a; }
+      .title { font-size: 24px; font-weight: 750; }
+      .subtitle { font-size: 15px; fill: #475569; }
+      .label { font-size: 17px; font-weight: 700; }
+      .small { font-size: 13px; fill: #475569; }
+      .tiny { font-size: 12px; fill: #64748b; }
+      .arrow { stroke: #334155; stroke-width: 2.2; fill: none; marker-end: url(#arrowhead); }
+      .arrow-soft { stroke: #64748b; stroke-width: 1.8; fill: none; marker-end: url(#arrowheadSoft); stroke-dasharray: 5 5; }
+    </style>
+    <marker id="arrowhead" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <path d="M0,0 L10,4 L0,8 Z" fill="#334155" />
+    </marker>
+    <marker id="arrowheadSoft" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <path d="M0,0 L10,4 L0,8 Z" fill="#64748b" />
+    </marker>
+  </defs>
+
+  <rect class="bg" width="1120" height="560" />
+
+  <text x="56" y="54" class="text title">Adaptive Prompt Automaton</text>
+  <text x="56" y="82" class="text subtitle">A finite-state prompt policy that routes LLM calls using runtime features, then optimizes prompts and guards.</text>
+
+  <rect x="44" y="114" width="1032" height="382" class="panel" />
+
+  <rect x="78" y="186" width="170" height="92" class="card accent1" />
+  <text x="101" y="222" class="text label">Task Input</text>
+  <text x="101" y="248" class="text small">Question, instruction,</text>
+  <text x="101" y="268" class="text small">or benchmark item</text>
+
+  <rect x="314" y="142" width="210" height="280" class="card accent2" />
+  <text x="350" y="178" class="text label">Automaton Runtime</text>
+
+  <rect x="350" y="205" width="138" height="48" class="card" />
+  <text x="384" y="235" class="text small">Start state</text>
+
+  <rect x="350" y="276" width="138" height="48" class="card" />
+  <text x="374" y="306" class="text small">Decompose</text>
+
+  <rect x="350" y="347" width="138" height="48" class="card" />
+  <text x="392" y="377" class="text small">Verify</text>
+
+  <path d="M419 253 L419 276" class="arrow" />
+  <path d="M419 324 L419 347" class="arrow" />
+  <path d="M488 229 C560 229, 560 372, 491 372" class="arrow-soft" />
+
+  <rect x="596" y="154" width="196" height="116" class="card accent3" />
+  <text x="632" y="190" class="text label">Feature Extractor</text>
+  <text x="623" y="218" class="text small">Length, uncertainty,</text>
+  <text x="623" y="238" class="text small">confidence, structure,</text>
+  <text x="623" y="258" class="text small">step number</text>
+
+  <rect x="596" y="306" width="196" height="116" class="card accent5" />
+  <text x="633" y="342" class="text label">Guarded Routing</text>
+  <text x="626" y="370" class="text small">Priority-sorted guards</text>
+  <text x="626" y="390" class="text small">choose next state or</text>
+  <text x="626" y="410" class="text small">stop at terminal</text>
+
+  <rect x="858" y="186" width="170" height="92" class="card accent1" />
+  <text x="902" y="222" class="text label">LLM Backend</text>
+  <text x="890" y="248" class="text small">MockLLM by default</text>
+  <text x="890" y="268" class="text small">OpenAI optional</text>
+
+  <rect x="858" y="330" width="170" height="92" class="card accent2" />
+  <text x="895" y="366" class="text label">Episode Log</text>
+  <text x="889" y="392" class="text small">Path, prompts, output,</text>
+  <text x="889" y="412" class="text small">tokens, reward</text>
+
+  <path d="M248 232 L314 232" class="arrow" />
+  <path d="M524 212 L596 212" class="arrow" />
+  <path d="M792 212 L858 232" class="arrow" />
+  <path d="M858 252 L792 364" class="arrow-soft" />
+  <path d="M596 364 L524 364" class="arrow" />
+  <path d="M694 270 L694 306" class="arrow" />
+  <path d="M792 376 L858 376" class="arrow" />
+
+  <rect x="205" y="455" width="220" height="72" class="card accent4" />
+  <text x="236" y="486" class="text label">Evolutionary Search</text>
+  <text x="234" y="510" class="text small">Mutates prompts and thresholds</text>
+
+  <rect x="456" y="455" width="220" height="72" class="card accent3" />
+  <text x="511" y="486" class="text label">Benchmarks</text>
+  <text x="486" y="510" class="text small">QA, shift, perturbation suites</text>
+
+  <rect x="707" y="455" width="220" height="72" class="card accent5" />
+  <text x="751" y="486" class="text label">Comparators</text>
+  <text x="748" y="510" class="text small">APA vs GEPA vs MIPRO</text>
+
+  <path d="M413 455 C420 425, 450 420, 472 422" class="arrow-soft" />
+  <path d="M566 455 C566 432, 566 430, 566 424" class="arrow-soft" />
+  <path d="M817 455 C802 430, 784 420, 756 422" class="arrow-soft" />
+</svg>

@@ -1,1 +1,0 @@
-"""AMPS-Hard scoring helpers."""
