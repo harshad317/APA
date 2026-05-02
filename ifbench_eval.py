@@ -51,7 +51,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from threading import Lock
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -169,19 +169,20 @@ def build_apa_seed() -> Automaton:
     transitions = [
         TransitionConfig(
             source_state="start", target_state="decompose",
-            condition="complexity_high", priority=1,
+            guard_type="threshold", feature_name="input_length",
+            operator=">", threshold=0.12, priority=2,
         ),
         TransitionConfig(
             source_state="start", target_state="verify",
-            condition="default", priority=2,
+            guard_type="always", operator="always", priority=1,
         ),
         TransitionConfig(
             source_state="decompose", target_state="verify",
-            condition="default", priority=1,
+            guard_type="always", operator="always", priority=1,
         ),
         TransitionConfig(
             source_state="verify", target_state="terminal",
-            condition="default", priority=1,
+            guard_type="always", operator="always", priority=1,
         ),
     ]
     cfg = AutomatonConfig(
@@ -209,6 +210,34 @@ def _apa_train_tasks_from_ifbench(
         )
         for ex in examples
     ]
+
+
+def _make_ifbench_episode_reward(
+    scorer: IFBenchOfficialScorer,
+    examples: List[IFBenchOfficialExample],
+) -> Callable[[Episode], float]:
+    """
+    Reward APA training with the same official IFBench verifier used at test time.
+
+    prompt_loose is binary and sparse, so instruction_loose supplies partial credit
+    when only some constraints pass. A small composite_reward tie-breaker keeps
+    malformed/empty outputs below useful outputs when verifier scores tie.
+    """
+    by_prompt = {ex.prompt: ex for ex in examples}
+
+    def reward(episode: Episode) -> float:
+        ex = by_prompt.get(episode.task_input)
+        if ex is None:
+            return composite_reward(episode)
+
+        response = episode.final_output or ""
+        passed = scorer.per_instruction(ex, response)
+        instr_score = sum(passed) / len(passed) if passed else 0.0
+        prompt_score = 1.0 if passed and all(passed) else 0.0
+        tie_break = max(0.0, composite_reward(episode)) * 0.05
+        return min(1.0, 0.80 * prompt_score + 0.15 * instr_score + tie_break)
+
+    return reward
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -439,16 +468,22 @@ def run_apa(
         ]
 
     extractor  = FeatureExtractor()
+    reward_fn = (
+        _make_ifbench_episode_reward(scorer, train_examples)
+        if train_examples else composite_reward
+    )
+    reward_label = "official IFBench verifier" if train_examples else "composite proxy"
+    console.print(f"  [dim]APA reward:[/dim] {reward_label}")
     apa_search = EvolutionarySearch(
         initial_automaton = build_apa_seed(),
         llm_api           = llm_apa,
         feature_extractor = extractor,
-        reward_fn         = composite_reward,
+        reward_fn         = reward_fn,
         n_generations     = 8,
         mutation_rate     = 0.40,
         elite_frac        = 0.25,
         tournament_size   = 3,
-        n_eval_tasks      = min(5, len(apa_tasks)),
+        n_eval_tasks      = min(getattr(args, "apa_eval_tasks", 5), len(apa_tasks)),
         seed              = SEED,
     )
     best_automaton = apa_search.run(
@@ -573,6 +608,7 @@ def main(args: argparse.Namespace) -> None:
     train_size = getattr(args, "train_size", 300)
     val_size   = getattr(args, "val_size", 100)
     workers    = getattr(args, "workers", 4)
+    apa_eval_tasks = getattr(args, "apa_eval_tasks", 5)
     methods    = [m.lower() for m in args.methods]
 
     # ── Banner ─────────────────────────────────────────────────────────────
@@ -593,6 +629,7 @@ def main(args: argparse.Namespace) -> None:
         f"  Model    : {_model_tag}\n"
         f"  Methods  : [green]{', '.join(methods)}[/green]\n"
         f"  Workers  : [green]{workers}[/green] (parallel LLM calls per eval pass)\n"
+        f"  APA eval tasks: [green]{apa_eval_tasks}[/green] per fitness evaluation\n"
         f"  DSPy cache: [green]disabled[/green] for GEPA/MIPRO\n"
         f"  Train    : [green]{train_size}[/green]  Val: [green]{val_size}[/green]  "
         f"Test: [green]300[/green] (official IFBench)",
@@ -728,6 +765,9 @@ Examples
   # Custom split sizes
   python ifbench_eval.py --model gpt-4.1-mini --train-size 200 --val-size 100
 
+  # Give APA a less noisy IFBench training signal
+  python ifbench_eval.py --model gpt-4.1-mini --apa-eval-tasks 20
+
   # Pass API key inline
   python ifbench_eval.py --model gpt-4.1-mini --api-key sk-...
 
@@ -776,6 +816,13 @@ Sequential execution
     p.add_argument(
         "--workers", type=int, default=4,
         help="Parallel LLM workers for eval passes (default: 4)",
+    )
+    p.add_argument(
+        "--apa-eval-tasks", dest="apa_eval_tasks", type=int, default=5,
+        help=(
+            "Training prompts sampled per APA fitness evaluation. Higher values "
+            "give a less noisy IFBench reward but use more API calls (default: 5)."
+        ),
     )
     p.add_argument(
         "--gepa-auto", dest="gepa_auto", default="light",

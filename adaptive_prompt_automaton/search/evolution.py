@@ -258,7 +258,7 @@ class EvolutionarySearch:
             # Track global best
             if gen_best.fitness > self.best_fitness:
                 self.best_fitness   = gen_best.fitness
-                self.best_automaton = gen_best.copy()
+                self.best_automaton = gen_best.copy(copy_diagnostics=True)
 
             self.history.append({
                 "generation":    gen,
@@ -279,7 +279,10 @@ class EvolutionarySearch:
 
             # ── Build next generation ─────────────────────────────────
             n_elite      = max(1, int(self.elite_frac * self.population_size))
-            new_pop      = [a.copy() for a in population[:n_elite]]
+            new_pop      = [
+                a.copy(copy_diagnostics=True)
+                for a in population[:n_elite]
+            ]
 
             while len(new_pop) < self.population_size:
                 if self.rng.random() < 0.55:

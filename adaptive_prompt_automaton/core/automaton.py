@@ -183,16 +183,20 @@ class Automaton:
         for cnt in self.path_counts.values():
             p = cnt / total
             h -= p * math.log2(p + 1e-12)
-        return h
+        return max(0.0, h)
 
     # ------------------------------------------------------------------
-    def copy(self) -> "Automaton":
+    def copy(self, copy_diagnostics: bool = False) -> "Automaton":
         """Deep-copy this automaton with a fresh ID."""
         new_config = self.config.copy(deep=True)
         new_config.automaton_id = str(uuid.uuid4())[:8]
         new_config.name = self.name + "_copy"
         child = Automaton(new_config)
         child.fitness = self.fitness
+        if copy_diagnostics:
+            child.episodes_run = self.episodes_run
+            child.path_counts = dict(self.path_counts)
+            child.reward_history = list(self.reward_history)
         return child
 
     # ------------------------------------------------------------------
