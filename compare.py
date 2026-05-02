@@ -51,7 +51,17 @@ from adaptive_prompt_automaton.core.automaton import (
 from adaptive_prompt_automaton.core.features import FeatureExtractor
 from adaptive_prompt_automaton.core.executor import AutomatonExecutor, Episode
 from adaptive_prompt_automaton.search.evolution import EvolutionarySearch
-from adaptive_prompt_automaton.search.gepa import GEPASearch
+
+# Auto-detect DSPy: use official dspy.GEPA when available,
+# fall back to the hand-reimplementation for environments without dspy.
+try:
+    from adaptive_prompt_automaton.search.gepa_dspy import GEPADSPySearch as _GEPABackend
+    _GEPA_BACKEND_LABEL = "GEPA (DSPy official)"
+    _GEPA_USES_DSPY     = True
+except ImportError:
+    from adaptive_prompt_automaton.search.gepa import GEPASearch as _GEPABackend  # type: ignore[assignment]
+    _GEPA_BACKEND_LABEL = "GEPA (hand-reimpl)"
+    _GEPA_USES_DSPY     = False
 
 # Auto-detect DSPy: use official MIPROv2 wrapper when available,
 # fall back to the hand-reimplementation for environments without dspy.
@@ -389,8 +399,12 @@ def render_efficiency_chart(
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main() -> None:
-    _dspy_tag = (
-        "[green]DSPy MIPROv2[/green]" if _MIPRO_USES_DSPY
+    _gepa_tag  = (
+        "[green]dspy.GEPA (official)[/green]" if _GEPA_USES_DSPY
+        else "[dim]hand-reimpl[/dim]"
+    )
+    _mipro_tag = (
+        "[green]dspy.MIPROv2 (official)[/green]" if _MIPRO_USES_DSPY
         else "[dim]hand-reimpl[/dim]"
     )
     console.print(Panel.fit(
@@ -398,9 +412,10 @@ def main() -> None:
         "[dim]Benchmark comparison on identical tasks, same MockLLM backend,\n"
         "same reward function, same random seed.[/dim]\n\n"
         "  [cyan bold]APA[/cyan bold]   — Adaptive Prompt Automaton (stateful FSA, evolutionary search)\n"
-        "  [yellow bold]GEPA[/yellow bold]  — Reflective Prompt Evolution (ICLR 2026, arXiv:2507.19457)\n"
+        f"  [yellow bold]GEPA[/yellow bold]  — Reflective Prompt Evolution (ICLR 2026, arXiv:2507.19457)\n"
+        f"         [dim]backend:[/dim] {_gepa_tag}\n"
         f"  [magenta bold]MIPRO[/magenta bold] — Instruction + Demo Optimisation  (EMNLP 2024, arXiv:2406.11695)\n"
-        f"         [dim]backend:[/dim] {_dspy_tag}",
+        f"         [dim]backend:[/dim] {_mipro_tag}",
         title="[bold]Method Comparison[/bold]",
         border_style="white",
     ))
@@ -459,27 +474,41 @@ def main() -> None:
     apa_fitness = apa_search.best_fitness
 
     # ══════════════════════════════════════════════════════════════════════
-    # TRAIN — GEPA (Reflective Evolution)
+    # TRAIN — GEPA (Reflective Prompt Evolution)
     # ══════════════════════════════════════════════════════════════════════
     console.print(Panel(
-        "[yellow bold]Training GEPA — Reflective Prompt Evolution[/yellow bold]",
+        f"[yellow bold]Training {_GEPA_BACKEND_LABEL}[/yellow bold]",
         border_style="yellow",
     ))
-    gepa_seed = build_apa_automaton()           # same topology seed
-    gepa_search = GEPASearch(
-        initial_automaton    = gepa_seed,
-        llm_api              = llm_gepa,
-        feature_extractor    = extractor,
-        reward_fn            = composite_reward,
-        n_iterations         = 10,
-        n_trajectory_samples = 6,
-        failure_threshold    = 0.40,
-        n_eval_tasks         = 5,
-        seed                 = SEED,
-    )
-    best_gepa   = gepa_search.run(train_tasks, console=console)
-    gepa_calls  = llm_gepa.call_count
-    gepa_fitness = gepa_search.best_fitness
+
+    if _GEPA_USES_DSPY:
+        # Official dspy.GEPA path
+        gepa_search  = _GEPABackend(
+            auto             = "light",
+            n_eval_tasks     = 5,
+            seed             = SEED,
+            uncertainty_rate = 0.32,
+        )
+        best_gepa    = gepa_search.run(train_tasks, console=console)
+        gepa_calls   = gepa_search.call_count
+        gepa_fitness = gepa_search.best_fitness
+    else:
+        # Hand-reimplementation fallback path
+        gepa_seed   = build_apa_automaton()
+        gepa_search = _GEPABackend(
+            initial_automaton    = gepa_seed,
+            llm_api              = llm_gepa,
+            feature_extractor    = extractor,
+            reward_fn            = composite_reward,
+            n_iterations         = 10,
+            n_trajectory_samples = 6,
+            failure_threshold    = 0.40,
+            n_eval_tasks         = 5,
+            seed                 = SEED,
+        )
+        best_gepa    = gepa_search.run(train_tasks, console=console)
+        gepa_calls   = llm_gepa.call_count
+        gepa_fitness = gepa_search.best_fitness
 
     # ══════════════════════════════════════════════════════════════════════
     # TRAIN — MIPRO (Instruction + Demo Optimisation)

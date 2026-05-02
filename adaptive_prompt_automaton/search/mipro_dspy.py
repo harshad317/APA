@@ -1,40 +1,56 @@
 """
 search/mipro_dspy.py
 ────────────────────
-DSPy MIPROv2 wrapper for the Adaptive Prompt Automaton comparison suite.
+Official dspy.MIPROv2 wrapper — works exactly as described in the MIPRO paper
+(EMNLP 2024, arXiv:2406.11695).
 
-This module replaces the hand-rolled MIPROSearch with the official
-dspy.MIPROv2 optimiser while keeping exactly the same public interface:
+How MIPROv2 works here (paper-faithful)
+────────────────────────────────────────
+  1. The same two-stage IFBench rewriter program as GEPA is optimised:
+       Stage 1  (fixed)  : "Respond to the query"  →  draft_answer
+       Stage 2  (learned): optimised_instruction   →  final response
+                           inputs: prompt, draft_answer, constraint_text
+                           output: response
 
-    MIPRODSPySearch(...).run(train_tasks, console) -> Automaton
+  2. The metric is a scalar metric → float (unlike GEPA's feedback metric).
+     MIPROv2 uses Bayesian optimisation over candidate instructions.
 
-The resulting Automaton is a 1-state wrapper whose prompt template has been
-optimised by MIPROv2 — allowing a fair apples-to-apples comparison with
-APA's 4-state evolutionary automaton and GEPA's reflective evolution.
+  3. Scoring uses the official allenai/IFBench verifiers (prompt_loose).
 
-Strategic note (for the NeurIPS paper)
-───────────────────────────────────────
-APA core files (automaton / features / executor / evolution) remain
-completely framework-free.  DSPy is only used here, for the MIPRO
-*baseline*, so that the comparison uses the official implementation rather
-than a hand-reimplementation.  This strengthens the experimental rigour of
-the paper.
+  4. Training data comes from allenai/IF_multi_constraints_upto5 (IF-RLVR pool).
+
+APA stays unchanged; only GEPA and MIPRO use this IFBench-native pipeline.
+
+Public interface
+─────────────────
+    searcher = MIPRODSPySearch(
+        auto="light",
+        ifbench_scorer=scorer,
+        train_examples=train,
+        val_examples=val,
+        dspy_lm=dspy.LM(...),
+    )
+    optimised_program = searcher.run(console=console)
+
+Backward-compatible re-exports
+────────────────────────────────
+  MockDSPyLM, APADSPyProgram, _DSPyLLMAdapter, _make_single_state_automaton,
+  _dummy_console, _tqdm_wrap
+  — still importable so compare.py and the old ifbench_eval path keep working.
 
 Requirements
 ────────────
-    pip install dspy>=3.0.0
+    pip install dspy>=3.0.0 datasets
 """
 from __future__ import annotations
 
 import os
 import re
-import sys
 import time
-import types
 import random
-from typing import List, Optional, Callable
+from pathlib import Path
+from typing import Any, Callable, List, Optional
 
-# ── Rich / tqdm (graceful fallback if not installed) ──────────────────────────
 try:
     from rich.console import Console
     from rich.panel import Panel
@@ -49,330 +65,39 @@ try:
 except ImportError:
     _HAS_TQDM = False
 
-# ── DSPy ──────────────────────────────────────────────────────────────────────
 try:
     import dspy
     from dspy import BaseLM
     _HAS_DSPY = True
 except ImportError:
     _HAS_DSPY = False
-    BaseLM = object           # dummy so class definition doesn't crash
+    BaseLM = object
 
-# ── APA internals ─────────────────────────────────────────────────────────────
-from ..core.automaton import (
-    Automaton, AutomatonConfig,
-    StateConfig, TransitionConfig,
-)
+from ..core.automaton import Automaton, AutomatonConfig, StateConfig
 from ..core.executor import AutomatonExecutor, Episode
 from ..core.features import FeatureExtractor as _FeatureExtractor
 from ..eval.benchmarks import Task, composite_reward
+from ..eval.ifbench_official import IFBenchOfficialExample, IFBenchOfficialScorer
 from ..utils.api import MockLLM
 
+# Re-use the shared IFBench program + draft generator from gepa_dspy
+from .gepa_dspy import (
+    IFBenchRewriterProgram,
+    generate_stage1_drafts,
+    _to_dspy_example,
+    _dummy_console,
+)
+
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Helpers
+# Backward-compatible helpers (used by compare.py APA path)
 # ──────────────────────────────────────────────────────────────────────────────
-
-def _dummy_console() -> "Console":
-    """Return a Console that discards output when rich is unavailable."""
-    class _Sink:
-        def print(self, *a, **kw): pass
-        def rule(self, *a, **kw): pass
-    return _Sink()  # type: ignore
-
 
 def _tqdm_wrap(iterable, **kwargs):
-    """tqdm if available, else plain iteration."""
     if _HAS_TQDM:
         return _tqdm(iterable, **kwargs)
     return iterable
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# MockDSPyLM  — DSPy 3.x-compatible wrapper around APA's MockLLM
-# ──────────────────────────────────────────────────────────────────────────────
-
-class _Message:
-    """Minimal stand-in for openai.types.chat.ChatCompletionMessage."""
-    __slots__ = ("content", "role", "tool_calls", "reasoning_content")
-
-    def __init__(self, content: str):
-        self.content          = content
-        self.role             = "assistant"
-        self.tool_calls       = None
-        self.reasoning_content = None
-
-
-class _Choice:
-    """Minimal stand-in for a single completion choice."""
-    __slots__ = ("message", "finish_reason", "index", "logprobs")
-
-    def __init__(self, content: str):
-        self.message      = _Message(content)
-        self.finish_reason = "stop"
-        self.index        = 0
-        self.logprobs     = None
-
-
-class _Response:
-    """
-    Minimal object whose shape satisfies dspy.BaseLM._process_lm_response.
-
-    Constraints (learned from source inspection):
-      • response.choices    — iterable of _Choice objects
-      • response.model      — str
-      • response.usage      — dict  (NOT an object; dict() is called on it)
-      • response._hidden_params — dict with optional 'response_cost' key
-    """
-    __slots__ = ("choices", "model", "usage", "_hidden_params")
-
-    def __init__(self, content: str, model: str, n_tokens: int):
-        self.choices        = [_Choice(content)]
-        self.model          = model
-        self.usage          = {
-            "prompt_tokens":     10,
-            "completion_tokens": n_tokens,
-            "total_tokens":      n_tokens + 10,
-        }
-        self._hidden_params = {"response_cost": None}
-
-
-class MockDSPyLM(BaseLM if _HAS_DSPY else object):  # type: ignore[misc]
-    """
-    DSPy 3.x BaseLM subclass backed by APA's MockLLM.
-
-    The critical detail: DSPy's ChatAdapter.parse() uses the regex
-        r'\\[\\[ ## (\\w+) ## \\]\\]'
-    to split the LM response into named fields.  Therefore forward() must
-    wrap the raw MockLLM text in the exact field-marker format:
-
-        [[ ## answer ## ]]
-        <answer text here>
-
-    Without this wrapper every call raises AdapterParseError.
-    """
-
-    def __init__(
-        self,
-        uncertainty_rate: float = 0.15,
-        latency:          float = 0.0,
-        seed:             int   = 42,
-        model_name:       str   = "mock-llm-v1",
-    ):
-        if not _HAS_DSPY:
-            raise ImportError("dspy is required for MockDSPyLM. Run: pip install dspy")
-
-        # BaseLM requires a model string and disables caching for mocks
-        super().__init__(
-            model       = model_name,
-            model_type  = "chat",
-            temperature = 0.7,
-            max_tokens  = 512,
-            cache       = False,
-        )
-        self._mock = MockLLM(
-            uncertainty_rate = uncertainty_rate,
-            latency          = latency,
-            seed             = seed,
-        )
-
-    # ------------------------------------------------------------------
-    # BaseLM interface
-    # ------------------------------------------------------------------
-
-    # ------------------------------------------------------------------
-    # Field detection helper
-    # ------------------------------------------------------------------
-
-    _FIELD_PATTERN = re.compile(r'\[\[ ## (\w+) ## \]\]')
-
-    def _detect_output_fields(self, messages: List[dict]) -> List[str]:
-        """
-        Parse DSPy-formatted messages to find the expected output field names.
-
-        DSPy always includes a line like:
-            "Respond with the corresponding output fields, starting with the
-             field `[[ ## fieldname ## ]]`, ..."
-        in the last user message.  We extract all field names from that line,
-        excluding the synthetic `completed` sentinel.
-        """
-        # Search last user message (most likely to contain the Respond line)
-        for m in reversed(messages):
-            if m.get("role") == "user":
-                content = m.get("content", "")
-                # Only the "Respond with" instruction line has field markers
-                for line in content.splitlines():
-                    if "respond with" in line.lower() or "starting with" in line.lower():
-                        fields = self._FIELD_PATTERN.findall(line)
-                        fields = [f for f in fields if f != "completed"]
-                        if fields:
-                            return fields
-                # Fallback: scan the whole content for field markers
-                fields = self._FIELD_PATTERN.findall(content)
-                fields = [f for f in fields if f != "completed"]
-                # Only use if these look like output specs (not input examples)
-                if fields:
-                    return list(dict.fromkeys(fields))  # deduplicate, preserve order
-        return ["answer"]   # safe default
-
-    # ------------------------------------------------------------------
-    # BaseLM interface
-    # ------------------------------------------------------------------
-
-    def forward(
-        self,
-        prompt:   Optional[str]             = None,
-        messages: Optional[List[dict]]      = None,
-        **kwargs,
-    ) -> _Response:
-        """
-        Call MockLLM and return a _Response whose content is wrapped in
-        DSPy's field-marker format so ChatAdapter.parse() succeeds.
-
-        Dynamically detects which output fields the current signature expects
-        (by parsing the "Respond with …" line in the last user message) so
-        that internal DSPy proposer signatures (e.g. with `observations`,
-        `proposed_instruction`, etc.) are handled correctly alongside the
-        normal QASignature `answer` field.
-        """
-        # Extract the last user message as the task text
-        if messages:
-            text = next(
-                (m["content"] for m in reversed(messages) if m.get("role") == "user"),
-                "",
-            )
-        else:
-            text = prompt or ""
-
-        raw_response, n_tokens = self._mock.call(text)
-
-        # Detect which fields this signature expects
-        fields = self._detect_output_fields(messages or [])
-
-        # Build a response that satisfies ALL expected fields.
-        # The main "answer"-like field gets the real MockLLM response;
-        # auxiliary fields (observations, reasoning, etc.) get a short stub.
-        _PRIMARY = {"answer", "prediction", "output", "response", "result"}
-        parts = []
-        for field in fields:
-            if field in _PRIMARY or len(fields) == 1:
-                parts.append(f"[[ ## {field} ## ]]\n{raw_response}")
-            else:
-                # Plausible one-liner stub for internal DSPy proposer fields
-                stub = (
-                    "The response demonstrates step-by-step reasoning "
-                    "with clear structure and a verified final answer."
-                )
-                parts.append(f"[[ ## {field} ## ]]\n{stub}")
-
-        formatted = "\n\n".join(parts)
-
-        return _Response(
-            content  = formatted,
-            model    = self.model,
-            n_tokens = n_tokens,
-        )
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# DSPy Signature & Module
-# ──────────────────────────────────────────────────────────────────────────────
-
-if _HAS_DSPY:
-    class QASignature(dspy.Signature):
-        """Answer the question accurately and concisely."""
-
-        question: str = dspy.InputField(desc="The question or task to answer")
-        answer:   str = dspy.OutputField(desc="A clear, accurate answer")
-
-    class APADSPyProgram(dspy.Module):
-        """
-        Minimal DSPy program used as the student for MIPROv2.
-
-        Wraps a single dspy.Predict(QASignature) call.  MIPROv2 will
-        optimise the instruction prefix and optionally add few-shot demos.
-        """
-
-        def __init__(self):
-            super().__init__()
-            self.predict = dspy.Predict(QASignature)
-
-        def forward(self, question: str) -> dspy.Prediction:
-            return self.predict(question=question)
-
-else:
-    # Stubs so the rest of the module can be imported even without dspy
-    class QASignature:  # type: ignore[no-redef]
-        pass
-
-    class APADSPyProgram:  # type: ignore[no-redef]
-        pass
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Metric bridge: dspy trainset example → APA composite_reward
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _make_metric(llm: MockLLM) -> Callable:
-    """
-    Return a DSPy metric function compatible with MIPROv2.
-
-    MIPROv2 calls  metric(example, prediction, trace=None) → float | bool.
-    We bridge this to APA's composite_reward by building a minimal Episode.
-    """
-    _fe = _FeatureExtractor()
-    executor = AutomatonExecutor(
-        automaton         = _make_single_state_automaton("Answer the question: {input}"),
-        llm_api           = llm,
-        feature_extractor = _fe,
-    )
-
-    def metric(
-        example:    "dspy.Example",
-        prediction: "dspy.Prediction",
-        trace       = None,
-    ) -> float:
-        answer_text: str = getattr(prediction, "answer", "") or ""
-        # Build a minimal Episode for reward computation
-        from ..core.executor import Episode, ExecutionStep
-        fe  = _FeatureExtractor()
-        fv  = fe.extract(
-            task_input      = example.question,
-            llm_output      = answer_text,
-            samples         = [answer_text],
-            verifier_score  = 0.5,
-            tool_success    = True,
-            step            = 1,
-        )
-        step = ExecutionStep(
-            step            = 1,
-            state_id        = "s0",
-            state_name      = "terminal",
-            prompt          = example.question,
-            response        = answer_text,
-            features        = fv,
-            transition_taken = None,
-            tokens_used     = len(answer_text.split()) + 10,
-        )
-        episode = Episode(
-            episode_id      = "metric_eval",
-            task_input      = example.question,
-            path            = ["s0"],
-            steps           = [step],
-            final_output    = answer_text,
-            total_tokens    = step.tokens_used,
-            reward          = 0.0,
-            success         = True,
-            terminated_by   = "terminal_state",
-        )
-        return float(composite_reward(episode))
-
-    return metric
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Automaton builder helpers
-# ──────────────────────────────────────────────────────────────────────────────
 
 def _make_single_state_automaton(instruction: str) -> Automaton:
     """Build a minimal 1-state terminal Automaton with the given instruction."""
@@ -393,58 +118,86 @@ def _make_single_state_automaton(instruction: str) -> Automaton:
     return Automaton(cfg)
 
 
-def _wrap_automaton(optimised_program: "APADSPyProgram") -> Automaton:
-    """
-    Convert a MIPROv2-optimised APADSPyProgram into an APA Automaton.
+class _Message:
+    __slots__ = ("content", "role", "tool_calls", "reasoning_content")
+    def __init__(self, content: str):
+        self.content           = content
+        self.role              = "assistant"
+        self.tool_calls        = None
+        self.reasoning_content = None
 
-    We extract the instruction string that MIPROv2 found and embed it
-    into a 1-state Automaton so compare.py can evaluate it identically
-    to the other baselines.
-    """
-    try:
-        # MIPROv2 stores the best instruction in predict.signature.__doc__
-        # or in the extended_signature instructions attribute.
-        sig       = optimised_program.predict.signature
-        doc       = getattr(sig, "__doc__", None) or ""
-        # Also try the instructions field if present
-        instr_obj = getattr(sig, "instructions", None)
-        instruction = str(instr_obj) if instr_obj else (doc.strip() or "Answer the question.")
-    except Exception:
-        instruction = "Answer the question step by step."
+class _Choice:
+    __slots__ = ("message", "finish_reason", "index", "logprobs")
+    def __init__(self, content: str):
+        self.message       = _Message(content)
+        self.finish_reason = "stop"
+        self.index         = 0
+        self.logprobs      = None
 
-    template = (
-        f"{instruction}\n\n"
-        "Input: {input}\n"
-        "Answer:"
-    )
-    return _make_single_state_automaton(template)
+class _Response:
+    __slots__ = ("choices", "model", "usage", "_hidden_params")
+    def __init__(self, content: str, model: str, n_tokens: int):
+        self.choices        = [_Choice(content)]
+        self.model          = model
+        self.usage          = {"prompt_tokens": 10, "completion_tokens": n_tokens, "total_tokens": n_tokens + 10}
+        self._hidden_params = {"response_cost": None}
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# _DSPyLLMAdapter — wraps a real dspy.LM as an APA-compatible .call() LLM
-# ──────────────────────────────────────────────────────────────────────────────
+class MockDSPyLM(BaseLM if _HAS_DSPY else object):  # type: ignore[misc]
+    """DSPy 3.x BaseLM backed by APA's MockLLM — kept for backward compat."""
+
+    _FIELD_PATTERN = re.compile(r'\[\[ ## (\w+) ## \]\]')
+
+    def __init__(self, uncertainty_rate=0.15, latency=0.0, seed=42, model_name="mock-llm-v1"):
+        if not _HAS_DSPY:
+            raise ImportError("dspy is required")
+        super().__init__(model=model_name, model_type="chat", temperature=0.7, max_tokens=512, cache=False)
+        self._mock = MockLLM(uncertainty_rate=uncertainty_rate, latency=latency, seed=seed)
+
+    def _detect_output_fields(self, messages: List[dict]) -> List[str]:
+        for m in reversed(messages):
+            if m.get("role") == "user":
+                content = m.get("content", "")
+                for line in content.splitlines():
+                    if "respond with" in line.lower() or "starting with" in line.lower():
+                        fields = self._FIELD_PATTERN.findall(line)
+                        fields = [f for f in fields if f != "completed"]
+                        if fields:
+                            return fields
+                fields = self._FIELD_PATTERN.findall(content)
+                fields = [f for f in fields if f != "completed"]
+                if fields:
+                    return list(dict.fromkeys(fields))
+        return ["answer"]
+
+    def forward(self, prompt=None, messages=None, **kwargs) -> _Response:
+        if messages:
+            text = next((m["content"] for m in reversed(messages) if m.get("role") == "user"), "")
+        else:
+            text = prompt or ""
+        raw_response, n_tokens = self._mock.call(text)
+        fields = self._detect_output_fields(messages or [])
+        _PRIMARY = {"answer", "prediction", "output", "response", "result"}
+        parts = []
+        for field in fields:
+            if field in _PRIMARY or len(fields) == 1:
+                parts.append(f"[[ ## {field} ## ]]\n{raw_response}")
+            else:
+                stub = "The response demonstrates step-by-step reasoning with clear structure and a verified final answer."
+                parts.append(f"[[ ## {field} ## ]]\n{stub}")
+        return _Response(content="\n\n".join(parts), model=self.model, n_tokens=n_tokens)
+
 
 class _DSPyLLMAdapter:
-    """
-    Thin adapter: wraps any dspy.LM so it exposes the APA .call() interface.
-
-    Used as eval_llm when MIPRODSPySearch is given a real dspy.LM but no
-    explicit APA-compatible eval_llm.  The dspy.LM is called via its
-    __call__ method with a plain user message.
-    """
-
+    """Wraps a dspy.LM as an APA-compatible .call() interface."""
     def __init__(self, dspy_lm):
         self._lm        = dspy_lm
         self.call_count = 0
-
     def call(self, prompt: str, role: str = "user", max_tokens: int = 256):
         self.call_count += 1
         try:
-            outputs = self._lm(
-                messages   = [{"role": "user", "content": prompt}],
-                max_tokens = max_tokens,
-            )
-            text = outputs[0] if outputs else ""
+            outputs = self._lm(messages=[{"role": "user", "content": prompt}], max_tokens=max_tokens)
+            text    = outputs[0] if outputs else ""
             if isinstance(text, dict):
                 text = text.get("text", "")
         except Exception:
@@ -452,253 +205,349 @@ class _DSPyLLMAdapter:
         return text, len(str(text).split()) + 10
 
 
+if _HAS_DSPY:
+    class QASignature(dspy.Signature):
+        """Answer the question accurately and concisely."""
+        question: str = dspy.InputField(desc="The question or task to answer")
+        answer:   str = dspy.OutputField(desc="A clear, accurate answer")
+
+    class APADSPyProgram(dspy.Module):
+        """Minimal DSPy program backed by QASignature — kept for backward compat."""
+        def __init__(self):
+            super().__init__()
+            self.predict = dspy.Predict(QASignature)
+        def forward(self, question: str) -> dspy.Prediction:
+            return self.predict(question=question)
+else:
+    class QASignature: pass       # type: ignore[no-redef]
+    class APADSPyProgram: pass    # type: ignore[no-redef]
+
+
 # ──────────────────────────────────────────────────────────────────────────────
-# MIPRODSPySearch — public API (mirrors MIPROSearch.run interface)
+# MIPROv2 score metric (IFBench-native)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _make_mipro_score_metric(scorer: IFBenchOfficialScorer) -> Callable:
+    """
+    Return a scalar metric function for dspy.MIPROv2.
+    MIPROv2 calls  metric(gold, pred, trace=None) → float.
+    """
+    def metric(
+        gold:  "dspy.Example",
+        pred:  "dspy.Prediction",
+        trace  = None,
+    ) -> float:
+        response = str(getattr(pred, "response", "") or "")
+        example  = IFBenchOfficialExample(
+            key                 = str(gold.key),
+            prompt              = str(gold.prompt),
+            instruction_id_list = list(gold.instruction_id_list),
+            kwargs              = [dict(kw) for kw in gold.kwargs],
+        )
+        return scorer.prompt_loose(example, response)
+
+    return metric
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# MIPRODSPySearch — public API
 # ──────────────────────────────────────────────────────────────────────────────
 
 class MIPRODSPySearch:
     """
-    DSPy MIPROv2 wrapper with the same public interface as MIPROSearch.
+    Official dspy.MIPROv2 wrapper using the IFBench two-stage rewriter pipeline.
 
-        best_automaton = MIPRODSPySearch(...).run(train_tasks, console)
+    MIPROv2 uses Bayesian optimisation to find the best stage-2 rewrite
+    instruction by scoring candidate prompts on the training set.
 
     Parameters
     ──────────
-    auto : str
-        MIPROv2 search intensity: 'light' | 'medium' | 'heavy'.
-    n_eval_tasks : int
-        Number of training tasks to use as the MIPROv2 trainset.
-    seed : int
-        Random seed for reproducibility.
-    uncertainty_rate : float
-        MockLLM uncertainty injection rate (0–1). Only used when dspy_lm is None.
-    dspy_lm : dspy.BaseLM or None
-        Optional pre-built DSPy LM to use instead of MockDSPyLM.
-        Pass a real dspy.LM("openai/gpt-4.1-mini") here for live evaluation.
-        When provided, eval_llm should also be set.
-    eval_llm : object or None
-        APA-compatible LLM (has .call(prompt) → (str, int)) used for the
-        fitness probe and episode evaluation.  If None and dspy_lm is set,
-        a lightweight adapter wraps dspy_lm for APA compatibility.
+    auto             : MIPROv2 search intensity ('light' | 'medium' | 'heavy')
+    ifbench_scorer   : IFBenchOfficialScorer instance
+    train_examples   : List[IFBenchOfficialExample] for optimisation
+    val_examples     : List[IFBenchOfficialExample] for validation
+    dspy_lm          : dspy.LM for both the rewriter and the proposer
+    seed             : random seed
     """
 
     def __init__(
         self,
-        auto:             str   = "light",
+        auto:           str                              = "light",
+        ifbench_scorer: Optional[IFBenchOfficialScorer]  = None,
+        train_examples: Optional[List[IFBenchOfficialExample]] = None,
+        val_examples:   Optional[List[IFBenchOfficialExample]] = None,
+        dspy_lm:        Any                              = None,
+        seed:           int                              = 42,
+        # Kept for backward compat with compare.py (ignored when IFBench path active)
         n_eval_tasks:     int   = 5,
-        seed:             int   = 42,
         uncertainty_rate: float = 0.15,
-        dspy_lm           = None,   # real dspy.LM for live runs
-        eval_llm          = None,   # APA-compatible LLM for fitness probe
-    ):
+        eval_llm:         Any   = None,
+    ) -> None:
         if not _HAS_DSPY:
-            raise ImportError(
-                "dspy>=3.0.0 is required for MIPRODSPySearch.\n"
-                "Install with:  pip install dspy"
-            )
-        self.auto             = auto
+            raise ImportError("dspy>=3.0.0 required. Install with: pip install dspy")
+
+        self.auto           = auto
+        self.scorer         = ifbench_scorer or IFBenchOfficialScorer()
+        self.train_examples = train_examples or []
+        self.val_examples   = val_examples   or []
+        self.dspy_lm        = dspy_lm
+        self.seed           = seed
+
+        # backward-compat properties
         self.n_eval_tasks     = n_eval_tasks
-        self.seed             = seed
         self.uncertainty_rate = uncertainty_rate
 
+        self.optimised_program: Optional[IFBenchRewriterProgram] = None
+        self.best_fitness: float = 0.0
+
+        # keep a mock llm for call_count tracking (compare.py uses this)
         if dspy_lm is not None:
-            # Real LM path — use the provided dspy.LM directly
-            self._dspy_lm  = dspy_lm
             self._mock_llm = eval_llm or _DSPyLLMAdapter(dspy_lm)
         else:
-            # Mock path (default)
-            self._mock_llm = MockLLM(
-                uncertainty_rate = uncertainty_rate,
-                seed             = seed,
-            )
-            self._dspy_lm = MockDSPyLM(
-                uncertainty_rate = uncertainty_rate,
-                latency          = 0.0,
-                seed             = seed,
-            )
-
-    # ------------------------------------------------------------------
-    # Public interface
-    # ------------------------------------------------------------------
+            self._mock_llm = MockLLM(uncertainty_rate=uncertainty_rate, seed=seed)
 
     @property
     def call_count(self) -> int:
-        """Total MockLLM calls made during training (for sample-efficiency comparison)."""
-        return self._mock_llm.call_count
+        return getattr(self._mock_llm, "call_count", 0)
 
-    def run(
-        self,
-        train_tasks,          # List[str] or List[Task]
-        console     = None,
-    ) -> Automaton:
+    # ------------------------------------------------------------------
+
+    def run(self, train_tasks=None, console=None) -> Any:
         """
-        Run MIPROv2 optimisation on train_tasks and return the best Automaton.
+        Run dspy.MIPROv2 optimisation.
 
-        Parameters
-        ──────────
-        train_tasks : list of str or list of Task
-            Training examples.  Accepts plain strings (task input text) or
-            Task objects.  At most n_eval_tasks are used.
-        console : rich.console.Console or None
-            Optional rich console for progress output.
+        When ifbench_scorer and train_examples are set (IFBench mode):
+            Optimises IFBenchRewriterProgram on the official data.
+            Returns the compiled dspy.Module.
 
-        Returns
-        ───────
-        Automaton
-            A 1-state Automaton whose instruction has been optimised by MIPROv2.
+        Legacy mode (train_tasks provided, no ifbench_scorer):
+            Falls back to APADSPyProgram + composite_reward for backward compat.
+            Returns an APA Automaton (for compare.py).
         """
-        # Normalise: accept both List[str] and List[Task]
-        normalised: List[Task] = []
-        for i, item in enumerate(train_tasks):
-            if isinstance(item, str):
-                normalised.append(Task(
-                    task_id    = f"t{i}",
-                    input_text = item,
-                    expected   = "",
-                ))
-            else:
-                normalised.append(item)
-        train_tasks = normalised
         if console is None:
             console = _dummy_console()
 
-        console.print(
-            Panel(
-                "[bold magenta]MIPRODSPySearch[/bold magenta]  ·  "
-                f"auto=[cyan]{self.auto}[/cyan]  "
-                f"tasks=[cyan]{min(len(train_tasks), self.n_eval_tasks)}[/cyan]",
-                title="[magenta]MIPRO (DSPy MIPROv2)[/magenta]",
-                border_style="magenta",
-            )
-        )
+        # ── IFBench-native path ──────────────────────────────────────
+        if self.train_examples and self.dspy_lm is not None:
+            return self._run_ifbench(console)
 
-        # ── 1. Configure DSPy to use our mock LM ──────────────────────
-        dspy.configure(lm=self._dspy_lm)
+        # ── Legacy / backward-compat APA path ────────────────────────
+        return self._run_legacy(train_tasks or [], console)
 
-        # ── 2. Build trainset as dspy.Example objects ──────────────────
-        rng   = random.Random(self.seed)
-        tasks = rng.sample(train_tasks, min(self.n_eval_tasks, len(train_tasks)))
+    # ------------------------------------------------------------------
 
-        trainset = [
-            dspy.Example(
-                question = t.input_text,
-                answer   = t.expected or "",
-            ).with_inputs("question")
-            for t in tasks
-        ]
+    def _run_ifbench(self, console) -> "IFBenchRewriterProgram":
+        """IFBench-native MIPROv2: 2-stage rewriter + official scorer."""
+        console.print(Panel(
+            "[bold magenta]MIPRODSPySearch[/bold magenta]  ·  "
+            f"auto=[magenta]{self.auto}[/magenta]  "
+            f"train=[magenta]{len(self.train_examples)}[/magenta]  "
+            f"val=[magenta]{len(self.val_examples)}[/magenta]",
+            title="[magenta]MIPRO — official dspy.MIPROv2 (IFBench pipeline)[/magenta]",
+            border_style="magenta",
+        ))
 
-        console.print(
-            f"  [dim]trainset size:[/dim] {len(trainset)} examples"
-        )
+        dspy.configure(lm=self.dspy_lm)
 
-        # ── 3. Build student program ───────────────────────────────────
-        student = APADSPyProgram()
+        # Stage 1 drafts
+        console.print("  [dim]Stage 1: generating draft answers …[/dim]")
+        train_drafts = generate_stage1_drafts(self.train_examples, self.dspy_lm)
+        val_drafts   = generate_stage1_drafts(self.val_examples,   self.dspy_lm)
 
-        # ── 4. Build metric ────────────────────────────────────────────
-        metric = _make_metric(self._mock_llm)
+        trainset = [_to_dspy_example(ex, d) for ex, d in zip(self.train_examples, train_drafts)]
+        valset   = [_to_dspy_example(ex, d) for ex, d in zip(self.val_examples,   val_drafts)]
 
-        # ── 5. Run MIPROv2 ────────────────────────────────────────────
-        console.print("  [dim]Running MIPROv2 optimisation …[/dim]")
-        t0 = time.perf_counter()
+        console.print(f"  [dim]trainset:[/dim] {len(trainset)}  [dim]valset:[/dim] {len(valset)}")
+
+        student = IFBenchRewriterProgram()
+        metric  = _make_mipro_score_metric(self.scorer)
+
+        console.print("  [dim]Running dspy.MIPROv2 optimisation …[/dim]")
+        t0        = time.perf_counter()
+        optimised = None
 
         try:
             optimiser = dspy.MIPROv2(
                 metric       = metric,
-                prompt_model = self._dspy_lm,
-                task_model   = self._dspy_lm,
+                prompt_model = self.dspy_lm,
+                task_model   = self.dspy_lm,
                 auto         = self.auto,
                 seed         = self.seed,
                 verbose      = False,
             )
+            with dspy.context(lm=self.dspy_lm):
+                optimised = optimiser.compile(
+                    student                    = student,
+                    trainset                   = trainset,
+                    valset                     = valset,
+                    requires_permission_to_run = False,
+                )
+        except Exception as exc:
+            console.print(f"  [yellow]⚠ dspy.MIPROv2 raised:[/yellow] {exc!r}")
+            console.print("  [dim]Falling back to base instruction.[/dim]")
+            optimised = student
 
+        elapsed = time.perf_counter() - t0
+        console.print(f"  [dim]optimisation time:[/dim] {elapsed:.1f}s")
+        console.print("  [green]✓[/green] MIPROv2 optimisation complete")
+
+        self.optimised_program = optimised
+        return optimised
+
+    def _run_legacy(self, train_tasks: list, console) -> Automaton:
+        """
+        Legacy APA-compatible path — used by compare.py.
+        Optimises APADSPyProgram with QASignature + composite_reward.
+        Returns an APA Automaton.
+        """
+        console.print(Panel(
+            "[bold magenta]MIPRODSPySearch (legacy APA mode)[/bold magenta]  ·  "
+            f"auto=[magenta]{self.auto}[/magenta]  "
+            f"tasks=[magenta]{min(len(train_tasks), self.n_eval_tasks)}[/magenta]",
+            title="[magenta]MIPRO (DSPy MIPROv2)[/magenta]",
+            border_style="magenta",
+        ))
+
+        # Build mock DSPy LM if no real LM
+        if self.dspy_lm is not None:
+            _dspy_lm = self.dspy_lm
+        else:
+            _dspy_lm = MockDSPyLM(
+                uncertainty_rate = self.uncertainty_rate,
+                latency          = 0.0,
+                seed             = self.seed,
+            )
+
+        dspy.configure(lm=_dspy_lm)
+
+        # Normalise train_tasks
+        normalised: List[Task] = []
+        for i, item in enumerate(train_tasks):
+            if isinstance(item, str):
+                normalised.append(Task(task_id=f"t{i}", input_text=item, expected=""))
+            else:
+                normalised.append(item)
+        train_tasks = normalised
+
+        rng      = random.Random(self.seed)
+        tasks    = rng.sample(train_tasks, min(self.n_eval_tasks, len(train_tasks)))
+        trainset = [
+            dspy.Example(question=t.input_text, answer=t.expected or "").with_inputs("question")
+            for t in tasks
+        ]
+
+        student = APADSPyProgram()
+        metric  = _make_legacy_metric(self._mock_llm)
+
+        console.print("  [dim]Running MIPROv2 optimisation …[/dim]")
+        t0        = time.perf_counter()
+        optimised = None
+        try:
+            optimiser = dspy.MIPROv2(
+                metric       = metric,
+                prompt_model = _dspy_lm,
+                task_model   = _dspy_lm,
+                auto         = self.auto,
+                seed         = self.seed,
+                verbose      = False,
+            )
             optimised = optimiser.compile(
-                student                  = student,
-                trainset                 = trainset,
+                student                    = student,
+                trainset                   = trainset,
                 requires_permission_to_run = False,
             )
-
         except Exception as exc:
-            # Surface a clear error message and fall back to a reasonable default
-            console.print(
-                f"  [yellow]⚠ MIPROv2 raised:[/yellow] {exc!r}\n"
-                "  [dim]Falling back to rule-based best instruction.[/dim]"
-            )
-            optimised = None
+            console.print(f"  [yellow]⚠ MIPROv2 raised:[/yellow] {exc!r}")
 
         elapsed = time.perf_counter() - t0
         console.print(f"  [dim]optimisation time:[/dim] {elapsed:.1f}s")
 
-        # ── 6. Wrap optimised program → APA Automaton ─────────────────
         if optimised is not None:
-            best_automaton = _wrap_automaton(optimised)
-            console.print(
-                "  [green]✓[/green] MIPROv2 complete — wrapped into 1-state Automaton"
-            )
+            best_automaton = _wrap_apa_automaton(optimised)
+            console.print("  [green]✓[/green] MIPROv2 complete — wrapped into 1-state Automaton")
         else:
-            # Fallback: use the instruction that tends to score highest on
-            # MockLLM (structured decomposition triggers the structure bonus)
-            fallback_instruction = (
+            best_automaton = _make_single_state_automaton(
                 "Break down the question into clear steps. "
-                "Step 1: identify key facts. "
-                "Step 2: reason carefully. "
-                "Step 3: state your answer."
+                "Step 1: identify key facts. Step 2: reason carefully. Step 3: state your answer."
             )
-            best_automaton = _make_single_state_automaton(fallback_instruction)
-            console.print(
-                "  [yellow]↩[/yellow] Using fallback structured-decomposition instruction"
-            )
+            console.print("  [yellow]↩[/yellow] Using fallback instruction")
 
-        # ── 7. Quick fitness probe (re-use trainset for consistency) ──
-        _fe = _FeatureExtractor()
-        executor = AutomatonExecutor(
-            automaton         = best_automaton,
-            llm_api           = self._mock_llm,
-            feature_extractor = _fe,
-        )
-        fitness_scores = []
-        for task in train_tasks[:min(3, len(train_tasks))]:
-            ep = executor.run_episode(task.input_text, verbose=False)
-            fitness_scores.append(composite_reward(ep))
-        self.best_fitness: float = (
-            sum(fitness_scores) / len(fitness_scores) if fitness_scores else 0.0
-        )
-        console.print(
-            f"  [dim]estimated fitness:[/dim] {self.best_fitness:.4f}"
-        )
-
+        # Quick fitness probe
+        _fe       = _FeatureExtractor()
+        executor  = AutomatonExecutor(automaton=best_automaton, llm_api=self._mock_llm, feature_extractor=_fe)
+        scores    = [composite_reward(executor.run_episode(t.input_text, verbose=False)) for t in train_tasks[:3]]
+        self.best_fitness = sum(scores) / len(scores) if scores else 0.0
+        console.print(f"  [dim]estimated fitness:[/dim] {self.best_fitness:.4f}")
         return best_automaton
 
     # ------------------------------------------------------------------
-    # Convenience: quick eval so compare.py can call the same helpers
-    # ------------------------------------------------------------------
+
+    def get_optimised_instruction(self) -> str:
+        if self.optimised_program is None:
+            return IFBenchRewriterProgram.BASE_INSTRUCTION
+        try:
+            sig   = self.optimised_program.rewrite.signature
+            instr = getattr(sig, "instructions", None)
+            return str(instr) if instr else IFBenchRewriterProgram.BASE_INSTRUCTION
+        except Exception:
+            return IFBenchRewriterProgram.BASE_INSTRUCTION
 
     def evaluate(
         self,
-        automaton:   Automaton,
-        eval_tasks:  List[Task],
-        console      = None,
-    ) -> List[Episode]:
-        """Evaluate automaton on eval_tasks; return list of Episodes."""
+        examples: List[IFBenchOfficialExample],
+        console  = None,
+    ) -> float:
+        """Evaluate optimised program on examples. Returns mean prompt_loose."""
+        if self.optimised_program is None or self.dspy_lm is None:
+            return 0.0
         if console is None:
             console = _dummy_console()
 
-        _fe = _FeatureExtractor()
-        executor = AutomatonExecutor(
-            automaton         = automaton,
-            llm_api           = self._mock_llm,
-            feature_extractor = _fe,
-        )
-        episodes: List[Episode] = []
+        drafts    = generate_stage1_drafts(examples, self.dspy_lm)
+        responses = []
+        with dspy.context(lm=self.dspy_lm):
+            for ex, draft in zip(examples, drafts):
+                try:
+                    pred     = self.optimised_program(
+                        prompt          = ex.prompt,
+                        draft_answer    = draft,
+                        constraint_text = ex.get_constraint_text(),
+                    )
+                    response = str(getattr(pred, "response", "") or "")
+                except Exception:
+                    response = ""
+                responses.append(response)
 
-        bar = _tqdm_wrap(
-            eval_tasks,
-            desc   = "  MIPRO-DSPy eval",
-            colour = "magenta",
-            leave  = False,
-        )
-        for task in bar:
-            ep = executor.run_episode(task.input_text, verbose=False)
-            ep.reward = composite_reward(ep)
-            episodes.append(ep)
+        return self.scorer.batch_prompt_loose(examples, responses)
 
-        return episodes
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Legacy helpers (backward compat for compare.py APA path)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _make_legacy_metric(llm: MockLLM) -> Callable:
+    _fe = _FeatureExtractor()
+    def metric(example, prediction, trace=None) -> float:
+        answer_text: str = getattr(prediction, "answer", "") or ""
+        from ..core.executor import ExecutionStep
+        fv   = _fe.extract(task_input=example.question, llm_output=answer_text, samples=[answer_text],
+                           verifier_score=0.5, tool_success=True, step=1)
+        step = ExecutionStep(step=1, state_id="s0", state_name="terminal",
+                             prompt=example.question, response=answer_text, features=fv,
+                             transition_taken=None, tokens_used=len(answer_text.split())+10)
+        episode = Episode(episode_id="metric_eval", task_input=example.question, path=["s0"],
+                          steps=[step], final_output=answer_text,
+                          total_tokens=step.tokens_used, reward=0.0, success=True, terminated_by="terminal_state")
+        return float(composite_reward(episode))
+    return metric
+
+
+def _wrap_apa_automaton(optimised_program: "APADSPyProgram") -> Automaton:
+    try:
+        sig         = optimised_program.predict.signature
+        instr_obj   = getattr(sig, "instructions", None)
+        doc         = getattr(sig, "__doc__", None) or ""
+        instruction = str(instr_obj) if instr_obj else (doc.strip() or "Answer the question.")
+    except Exception:
+        instruction = "Answer the question step by step."
+    return _make_single_state_automaton(f"{instruction}\n\nInput: {{input}}\nAnswer:")

@@ -17,3 +17,5 @@ runs/
 artifacts/
 .cache/
 *.log
+vendor/**/.git/
+vendor/**/.nltk_data/

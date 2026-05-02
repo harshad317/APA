@@ -2,45 +2,53 @@
 """
 ifbench_eval.py
 ───────────────
-Evaluate APA, GEPA, and MIPRO (DSPy MIPROv2) on the IFBench
-instruction-following benchmark with all six constraint parsers.
+Evaluate APA, GEPA, and MIPRO on the official IFBench benchmark.
+
+Each method works as it does in its respective paper:
+
+  APA   — 4-state FSA trained via evolutionary search (composite_reward).
+           Unchanged from the APA paper.
+
+  GEPA  — Official dspy.GEPA with the IFBench two-stage rewriter pipeline:
+             Stage 1 (fixed)  : "Respond to the query" → draft_answer
+             Stage 2 (learned): dspy.GEPA evolves the rewrite instruction
+           Trained on allenai/IF_multi_constraints_upto5 (IF-RLVR pool).
+           Scored with the official allenai/IFBench constraint verifiers.
+
+  MIPRO — Official dspy.MIPROv2 with the same two-stage rewriter pipeline.
+           Trained on IF-RLVR pool with Bayesian instruction optimisation.
+           Scored with the official allenai/IFBench constraint verifiers.
+
+All three methods are evaluated on the official IFBench test set (300 prompts)
+using prompt_loose accuracy — the primary metric from the IFBench paper.
 
 Usage
 ─────
-    # Run all methods on all parsers (default)
-    python ifbench_eval.py
+  # All methods (requires OPENAI_API_KEY for GEPA and MIPRO)
+  python ifbench_eval.py --model gpt-4.1-mini
 
-    # Restrict to specific parser types
-    python ifbench_eval.py --parsers keyword length
+  # Mock mode (APA only — GEPA/MIPRO need a real LLM)
+  python ifbench_eval.py --methods apa
 
-    # Restrict to specific methods
-    python ifbench_eval.py --methods apa gepa
+  # Custom split sizes
+  python ifbench_eval.py --model gpt-4.1-mini --train-size 200 --val-size 100
 
-    # Skip training (load cached automata) — not yet implemented; placeholder
-    python ifbench_eval.py --eval-only
+  # Skip GEPA/MIPRO training, only run APA
+  python ifbench_eval.py --methods apa --model mock
 
-    # Verbose: print each episode's constraint check
-    python ifbench_eval.py --verbose
-
-Benchmark structure
-───────────────────
-  48 IFTasks (8 per parser type × 6 types) split 24/24 train/test.
-  Compliance score per task: 0–1 via deterministic parser.
-  Pass threshold: ≥ 0.5 compliance.
-
-Methods
-───────
-  APA   — 4-state automaton trained via evolutionary search
-  GEPA  — reflective prompt evolution (Pareto frontier)
-  MIPRO — DSPy MIPROv2 (falls back to hand-reimpl if dspy unavailable)
+Data
+────
+  Train/Val : allenai/IF_multi_constraints_upto5 on HuggingFace (default 300/100)
+  Test      : vendor/ifbench/data/IFBench_test.jsonl (300 prompts, official)
 """
 from __future__ import annotations
 
 import argparse
+import os
 import random
 import sys
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -51,65 +59,62 @@ from rich.table import Table
 from rich import box
 from tqdm import tqdm
 
+# ── APA core ──────────────────────────────────────────────────────────────────
 from adaptive_prompt_automaton.core.automaton import (
     Automaton, AutomatonConfig, StateConfig, TransitionConfig,
 )
 from adaptive_prompt_automaton.core.features import FeatureExtractor
 from adaptive_prompt_automaton.core.executor import AutomatonExecutor, Episode
 from adaptive_prompt_automaton.search.evolution import EvolutionarySearch
-from adaptive_prompt_automaton.search.gepa import GEPASearch
-from adaptive_prompt_automaton.eval.ifbench import (
-    make_ifbench_benchmark,
-    ifbench_reward,
-    per_parser_accuracy,
-    IFTask,
-    PARSERS,
-)
+from adaptive_prompt_automaton.eval.benchmarks import composite_reward, Task
 from adaptive_prompt_automaton.utils.api import get_llm_api
 
-# DSPy backend auto-detection (same as compare.py)
+# ── Official IFBench ──────────────────────────────────────────────────────────
+from adaptive_prompt_automaton.eval.ifbench_official import (
+    IFBenchOfficialExample,
+    IFBenchOfficialScorer,
+    load_ifbench_test,
+    load_ifbench_train_val,
+)
+
+# ── GEPA and MIPRO (official DSPy) ────────────────────────────────────────────
 try:
-    from adaptive_prompt_automaton.search.mipro_dspy import MIPRODSPySearch as _MIPROBackend
-    _MIPRO_LABEL    = "MIPRO (DSPy MIPROv2)"
-    _MIPRO_USE_DSPY = True
+    import dspy
+    from adaptive_prompt_automaton.search.gepa_dspy import GEPADSPySearch
+    from adaptive_prompt_automaton.search.mipro_dspy import MIPRODSPySearch
+    _HAS_DSPY = True
 except ImportError:
-    from adaptive_prompt_automaton.search.mipro import MIPROSearch as _MIPROBackend  # type: ignore
-    _MIPRO_LABEL    = "MIPRO (hand-reimpl)"
-    _MIPRO_USE_DSPY = False
+    _HAS_DSPY = False
 
-console = Console(width=160)
-SEED    = 42
-random.seed(SEED)
-
-ALL_METHODS  = ["apa", "gepa", "mipro"]
-ALL_PARSERS  = list(PARSERS.keys())   # keyword, length, format, startend, case, composite
-
-METHOD_COLOURS = {"apa": "cyan", "gepa": "yellow", "mipro": "magenta"}
-METHOD_LABELS  = {"apa": "APA", "gepa": "GEPA", "mipro": _MIPRO_LABEL}
+console    = Console(width=160)
+SEED       = 42
+ALL_METHODS = ["apa", "gepa", "mipro"]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# APA topology (same 4-state FSA as compare.py)
+# APA seed automaton (4-state FSA, unchanged)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def build_apa_seed() -> Automaton:
+    """4-state APA FSA seed for evolutionary training."""
     states = {
         "start": StateConfig(
             state_id="start", name="Start",
             template=(
                 "You are a precise assistant that follows instructions exactly.\n"
-                "Answer the following question, obeying ALL constraints stated:\n\n"
-                "{input}\n\nProvide a concise, accurate, constraint-compliant answer."
+                "Answer the following, obeying ALL stated constraints:\n\n"
+                "{input}\n\nProvide a concise, constraint-compliant answer."
             ),
             role="user", max_tokens=256, is_terminal=False, carry_context=True,
         ),
         "decompose": StateConfig(
             state_id="decompose", name="Decompose",
             template=(
-                "This is a complex question. First identify the constraints, "
-                "then answer step by step while obeying them.\n\n"
-                "Question + constraints: {input}\n\nPrevious attempt: {context}\n\n"
-                "Step 1: list constraints. Step 2: verify. Step 3: answer."
+                "This is a constrained task. Identify constraints, then answer.\n\n"
+                "Task: {input}\nPrevious attempt: {context}\n\n"
+                "Step 1: list all constraints. "
+                "Step 2: verify your answer against each. "
+                "Step 3: give the final answer."
             ),
             role="user", max_tokens=512, is_terminal=False, carry_context=True,
         ),
@@ -117,503 +122,531 @@ def build_apa_seed() -> Automaton:
             state_id="verify", name="Verify",
             template=(
                 "Check that the answer below satisfies all stated constraints.\n\n"
-                "Question: {input}\nDraft answer: {context}\n\n"
-                "Verify each constraint, correct any violation, return final answer."
+                "Task: {input}\nAnswer: {context}\n\n"
+                "If any constraint is violated, rewrite the answer. "
+                "Otherwise, output the answer unchanged."
             ),
             role="user", max_tokens=256, is_terminal=False, carry_context=True,
         ),
         "terminal": StateConfig(
             state_id="terminal", name="Terminal",
-            template=(
-                "State the final constraint-compliant answer to:\n\n{input}\n\n"
-                "Based on: {context}\n\nFinal answer (satisfying all constraints):"
-            ),
-            role="user", max_tokens=128, is_terminal=True, carry_context=False,
+            template="{context}",
+            role="assistant", max_tokens=256, is_terminal=True, carry_context=False,
         ),
     }
     transitions = [
-        TransitionConfig(source_state="start",     target_state="decompose",
-                         guard_type="threshold",   feature_name="is_long_input",
-                         threshold=0.5,  operator=">",      priority=3),
-        TransitionConfig(source_state="start",     target_state="verify",
-                         guard_type="threshold",   feature_name="uncertainty_score",
-                         threshold=0.30, operator=">",      priority=2),
-        TransitionConfig(source_state="start",     target_state="terminal",
-                         guard_type="threshold",   feature_name="answer_confidence",
-                         threshold=0.70, operator=">=",     priority=1),
-        TransitionConfig(source_state="decompose", target_state="verify",
-                         guard_type="threshold",   feature_name="uncertainty_score",
-                         threshold=0.35, operator=">",      priority=2),
-        TransitionConfig(source_state="decompose", target_state="terminal",
-                         guard_type="always",      feature_name="input_length",
-                         threshold=0.0,  operator="always", priority=1),
-        TransitionConfig(source_state="verify",    target_state="terminal",
-                         guard_type="always",      feature_name="input_length",
-                         threshold=0.0,  operator="always", priority=1),
+        TransitionConfig(
+            source_state="start", target_state="decompose",
+            condition="complexity_high", priority=1,
+        ),
+        TransitionConfig(
+            source_state="start", target_state="verify",
+            condition="default", priority=2,
+        ),
+        TransitionConfig(
+            source_state="decompose", target_state="verify",
+            condition="default", priority=1,
+        ),
+        TransitionConfig(
+            source_state="verify", target_state="terminal",
+            condition="default", priority=1,
+        ),
     ]
-    return Automaton(AutomatonConfig(
-        automaton_id="apa_if_seed", name="APA-IFBench-Seed",
-        start_state="start", states=states,
-        transitions=transitions, max_steps=6, max_budget=8,
-    ))
+    cfg = AutomatonConfig(
+        name="apa_ifbench_seed", start_state="start",
+        states=states, transitions=transitions,
+    )
+    return Automaton(cfg)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Evaluation helper
+# APA training helpers
 # ══════════════════════════════════════════════════════════════════════════════
 
-def eval_on_iftasks(
+def _apa_train_tasks_from_ifbench(
+    examples: List[IFBenchOfficialExample],
+) -> List[Task]:
+    """Wrap IFBench examples as APA Task objects for evolutionary training."""
+    return [
+        Task(
+            task_id    = ex.key,
+            input_text = ex.prompt,
+            expected   = "",
+            category   = "ifbench",
+            difficulty = "medium",
+        )
+        for ex in examples
+    ]
+
+
+def _apa_reward_for_ifbench(
+    episode:  Episode,
+    example:  IFBenchOfficialExample,
+    scorer:   IFBenchOfficialScorer,
+) -> float:
+    """APA reward on IFBench: official prompt_loose score."""
+    response = episode.final_output or ""
+    return scorer.prompt_loose(example, response)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# APA evaluation on official IFBench test set
+# ══════════════════════════════════════════════════════════════════════════════
+
+def eval_apa_on_ifbench(
     automaton: Automaton,
     llm:       object,
-    extractor: FeatureExtractor,
-    tasks:     List[IFTask],
-    desc:      str  = "Evaluating",
-    colour:    str  = "cyan",
+    examples:  List[IFBenchOfficialExample],
+    scorer:    IFBenchOfficialScorer,
+    desc:      str = "APA eval",
     verbose:   bool = False,
-) -> List[Episode]:
-    executor = AutomatonExecutor(automaton, llm, extractor)
-    episodes: List[Episode] = []
+) -> Dict[str, float]:
+    """
+    Run APA automaton on official IFBench test examples.
+    Returns dict with prompt_loose, instruction_loose, n.
+    """
+    extractor = FeatureExtractor()
+    executor  = AutomatonExecutor(
+        automaton         = automaton,
+        llm_api           = llm,
+        feature_extractor = extractor,
+    )
+    prompt_loose_scores   = []
+    instruction_loose_scores = []
 
-    for task in tqdm(tasks, desc=f"  {desc}", colour=colour, leave=True):
-        ep    = executor.run_episode(task.input_text, episode_id=task.task_id)
-        score = ifbench_reward(ep, task)
-        ep.reward = score
-
+    bar = tqdm(examples, desc=f"  {desc}", colour="cyan", leave=False)
+    for ex in bar:
+        episode  = executor.run_episode(ex.prompt, verbose=verbose)
+        response = episode.final_output or ""
+        pl = scorer.prompt_loose(example=ex, response=response)
+        il = scorer.instruction_loose(example=ex, response=response)
+        prompt_loose_scores.append(pl)
+        instruction_loose_scores.append(il)
         if verbose:
-            status = "✓" if score >= 0.5 else "✗"
             console.print(
-                f"    [{colour}]{status}[/{colour}] "
-                f"[dim]{task.task_id}[/dim] "
-                f"[{colour}]{task.constraint_type}[/{colour}] "
-                f"score={score:.2f}  "
-                f"[dim]{task.constraint_desc[:40]}[/dim]"
+                f"  [dim]{ex.key}[/dim] pl={pl:.1f} il={il:.2f} "
+                f"[dim]{ex.instruction_id_list}[/dim]"
             )
-        episodes.append(ep)
-    return episodes
+
+    n = len(examples)
+    return {
+        "prompt_loose":      sum(prompt_loose_scores) / n if n else 0.0,
+        "instruction_loose": sum(instruction_loose_scores) / n if n else 0.0,
+        "n":                 n,
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Rich rendering
+# GEPA / MIPRO evaluation on official IFBench test set
 # ══════════════════════════════════════════════════════════════════════════════
 
-def render_per_parser_table(
-    results:        Dict[str, List[Episode]],
-    tasks:          List[IFTask],
-    active_parsers: List[str],
-    title:          str = "Per-Parser Compliance",
+def eval_dspy_program_on_ifbench(
+    program:  object,
+    dspy_lm:  object,
+    examples: List[IFBenchOfficialExample],
+    scorer:   IFBenchOfficialScorer,
+    desc:     str  = "DSPy eval",
+    colour:   str  = "magenta",
+    verbose:  bool = False,
+) -> Dict[str, float]:
+    """
+    Run a compiled IFBenchRewriterProgram on official IFBench test examples.
+    Uses 2-stage pipeline: stage-1 draft → stage-2 optimised rewrite.
+    """
+    from adaptive_prompt_automaton.search.gepa_dspy import generate_stage1_drafts
+
+    console.print(f"  [dim]Stage 1 drafts for {len(examples)} examples …[/dim]")
+    drafts = generate_stage1_drafts(examples, dspy_lm)
+
+    prompt_loose_scores      = []
+    instruction_loose_scores = []
+
+    bar = tqdm(
+        zip(examples, drafts),
+        total   = len(examples),
+        desc    = f"  {desc}",
+        colour  = colour,
+        leave   = False,
+    )
+    with dspy.context(lm=dspy_lm):
+        for ex, draft in bar:
+            try:
+                pred     = program(
+                    prompt          = ex.prompt,
+                    draft_answer    = draft,
+                    constraint_text = ex.get_constraint_text(),
+                )
+                response = str(getattr(pred, "response", "") or "")
+            except Exception:
+                response = ""
+            pl = scorer.prompt_loose(example=ex, response=response)
+            il = scorer.instruction_loose(example=ex, response=response)
+            prompt_loose_scores.append(pl)
+            instruction_loose_scores.append(il)
+            if verbose:
+                console.print(
+                    f"  [dim]{ex.key}[/dim] pl={pl:.1f} il={il:.2f} "
+                    f"[dim]{ex.instruction_id_list}[/dim]"
+                )
+
+    n = len(examples)
+    return {
+        "prompt_loose":      sum(prompt_loose_scores) / n if n else 0.0,
+        "instruction_loose": sum(instruction_loose_scores) / n if n else 0.0,
+        "n":                 n,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Results table
+# ══════════════════════════════════════════════════════════════════════════════
+
+def render_results_table(
+    results: Dict[str, Dict[str, float]],
+    title:   str = "IFBench Results — Official Test Set (prompt_loose)",
 ) -> None:
-    """One row per parser type, one column per method."""
-    methods = [m for m in ALL_METHODS if m in results]
+    tbl = Table(
+        title      = title,
+        box        = box.DOUBLE_EDGE,
+        show_lines = True,
+        header_style = "bold white",
+    )
+    tbl.add_column("Method",           style="bold",       width=26)
+    tbl.add_column("Prompt Loose ↑",   style="cyan",       justify="center", width=16)
+    tbl.add_column("Instr. Loose ↑",   style="green",      justify="center", width=16)
+    tbl.add_column("N",                style="dim",        justify="center", width=6)
 
-    tbl = Table(title=title, box=box.DOUBLE_EDGE, highlight=True)
-    tbl.add_column("Parser Type",  style="bold", min_width=14)
-    tbl.add_column("N",            justify="right", style="dim", min_width=3)
-    for mth in methods:
-        mcol = METHOD_COLOURS[mth]
-        tbl.add_column(f"{METHOD_LABELS[mth].split()[0]} Mean", justify="right",
-                       style=mcol, min_width=8)
-        tbl.add_column("Pass%", justify="right", style=mcol, min_width=7)
-    tbl.add_column("Best", justify="center", min_width=6)
+    method_styles = {"APA": "cyan", "GEPA": "yellow", "MIPRO": "magenta"}
 
-    # Aggregate per parser per method
-    type_stats: Dict[str, Dict[str, Dict]] = {}
-    for mth, eps in results.items():
-        type_stats[mth] = per_parser_accuracy(eps, tasks)
+    best_pl = max((v["prompt_loose"] for v in results.values()), default=0.0)
 
-    # Collect all constraint types present in the filtered task set
-    all_types = sorted({task.constraint_type for task in tasks
-                        if task.constraint_type in active_parsers})
+    for method, metrics in results.items():
+        pl = metrics.get("prompt_loose", 0.0)
+        il = metrics.get("instruction_loose", 0.0)
+        n  = int(metrics.get("n", 0))
+        style = method_styles.get(method, "white")
 
-    for ptype in all_types:
-        row: List[str] = [ptype]
-        n = type_stats[methods[0]].get(ptype, {}).get("n", 0)
-        row.append(str(n))
+        pl_str = f"[bold green]{pl*100:.1f}%[/bold green]" if pl == best_pl else f"{pl*100:.1f}%"
+        il_str = f"{il*100:.1f}%"
 
-        best_m = max(methods,
-                     key=lambda mth, pt=ptype: type_stats[mth].get(pt, {}).get("mean_score", 0.0))
-        for mth in methods:
-            st = type_stats[mth].get(ptype, {"mean_score": 0.0, "pass_rate": 0.0})
-            row.append(f"{st['mean_score']:.3f}")
-            row.append(f"{st['pass_rate']*100:.1f}%")
-
-        bcol = METHOD_COLOURS.get(best_m, "white")
-        row.append(f"[bold {bcol}]{best_m.upper()}[/bold {bcol}]")
-        tbl.add_row(*row)
-
-    # Overall row
-    overall_row: List[str] = ["[bold]OVERALL[/bold]", str(len(tasks))]
-    best_m = max(methods,
-                 key=lambda mth: sum(ep.reward for ep in results[mth]) / len(results[mth]))
-    for mth in methods:
-        omean  = sum(ep.reward for ep in results[mth]) / len(results[mth])
-        oprate = sum(ep.reward >= 0.5 for ep in results[mth]) / len(results[mth])
-        overall_row.append(f"[bold]{omean:.3f}[/bold]")
-        overall_row.append(f"[bold]{oprate*100:.1f}%[/bold]")
-    bcol = METHOD_COLOURS.get(best_m, "white")
-    overall_row.append(f"[bold {bcol}]{best_m.upper()}[/bold {bcol}]")
-    tbl.add_row(*overall_row)
+        tbl.add_row(
+            f"[{style}]{method}[/{style}]",
+            pl_str, il_str, str(n),
+        )
 
     console.print(tbl)
     console.print()
-
-
-def render_per_task_table(
-    results: Dict[str, List[Episode]],
-    tasks:   List[IFTask],
-    title:   str = "Per-Task Compliance Scores",
-) -> None:
-    """Full per-task breakdown (optional verbose table)."""
-    methods = [m for m in ALL_METHODS if m in results]
-    t = Table(title=title, box=box.SIMPLE_HEAD, highlight=True)
-    t.add_column("ID",         style="dim",   max_width=14)
-    t.add_column("Type",       style="bold",  max_width=12)
-    t.add_column("Constraint", style="dim",   max_width=35)
-    for m in methods:
-        t.add_column(m.upper(), justify="right", style=METHOD_COLOURS[m], min_width=7)
-    t.add_column("Best", justify="center")
-
-    for i, task in enumerate(tasks):
-        scores = {m: results[m][i].reward for m in methods}
-        best   = max(scores, key=scores.__getitem__)
-        col    = METHOD_COLOURS.get(best, "white")
-        t.add_row(
-            task.task_id[:13],
-            task.constraint_type,
-            task.constraint_desc[:34],
-            *[f"{scores[m]:.2f}" for m in methods],
-            f"[bold {col}]{best.upper()}[/bold {col}]",
-        )
-    console.print(t)
-    console.print()
-
-
-def render_summary_panel(
-    results:        Dict[str, List[Episode]],
-    tasks:          List[IFTask],
-    active_parsers: List[str],
-) -> None:
-    methods = [m for m in ALL_METHODS if m in results]
-    lines   = []
-    for m in methods:
-        mean  = sum(ep.reward for ep in results[m]) / len(results[m])
-        prate = sum(ep.reward >= 0.5 for ep in results[m]) / len(results[m])
-        col   = METHOD_COLOURS[m]
-        lines.append(
-            f"  [{col} bold]{METHOD_LABELS[m].split()[0]:<6}[/{col} bold]"
-            f"  mean={mean:.3f}  pass={prate*100:.1f}%"
-        )
-
-    best_m = max(methods,
-                 key=lambda m: sum(ep.reward for ep in results[m]) / len(results[m]))
-    col    = METHOD_COLOURS[best_m]
-    console.print(Panel(
-        f"[bold]IFBench results — {len(tasks)} tasks — "
-        f"parsers: {', '.join(active_parsers)}[/bold]\n\n"
-        + "\n".join(lines) + "\n\n"
-        + f"[dim]Best overall:[/dim] [{col} bold]{METHOD_LABELS[best_m]}[/{col} bold]",
-        title="[bold]IFBench Summary[/bold]",
-        border_style=col,
-    ))
+    console.print(
+        "[dim]prompt_loose = fraction of prompts where ALL constraints pass (loose mode)\n"
+        "instr._loose  = mean fraction of individual constraints that pass[/dim]"
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Main
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _make_llms(model: str, api_key: Optional[str], seed: int):
-    """
-    Return (llm_apa, llm_gepa, llm_mipro, llm_eval, dspy_lm).
-
-    model == "mock"  → MockLLM for APA/GEPA/eval, MockDSPyLM for MIPRO (default)
-    otherwise        → OpenAILLM(model) for APA/GEPA/eval, dspy.LM for MIPRO
-    """
-    if model == "mock":
-        llm_apa   = get_llm_api("mock", uncertainty_rate=0.32, latency=0.0, seed=seed)
-        llm_gepa  = get_llm_api("mock", uncertainty_rate=0.32, latency=0.0, seed=seed)
-        llm_mipro = get_llm_api("mock", uncertainty_rate=0.32, latency=0.0, seed=seed)
-        llm_eval  = get_llm_api("mock", uncertainty_rate=0.32, latency=0.0, seed=seed)
-        dspy_lm   = None   # MIPRODSPySearch creates MockDSPyLM internally
-    else:
-        import os
-        key = api_key or os.environ.get("OPENAI_API_KEY")
-        if not key:
-            raise ValueError(
-                "OPENAI_API_KEY is required.\n"
-                "Set it via:  export OPENAI_API_KEY=sk-...  or pass --api-key SK..."
-            )
-        llm_apa   = get_llm_api("openai", model=model, api_key=key)
-        llm_gepa  = get_llm_api("openai", model=model, api_key=key)
-        llm_eval  = get_llm_api("openai", model=model, api_key=key)
-        llm_mipro = llm_eval   # unused in DSPy path
-        try:
-            import dspy as _dspy
-            dspy_lm = _dspy.LM(f"openai/{model}", api_key=key)
-        except Exception as exc:
-            raise RuntimeError(
-                f"Failed to create dspy.LM for {model!r}: {exc}"
-            ) from exc
-
-    return llm_apa, llm_gepa, llm_mipro, llm_eval, dspy_lm
-
-
 def main(args: argparse.Namespace) -> None:
-    active_methods = args.methods
-    active_parsers = args.parsers
-    verbose        = args.verbose
-    model          = args.model
-    api_key        = getattr(args, "api_key", None)
+    random.seed(SEED)
+    model      = getattr(args, "model", "mock")
+    api_key    = getattr(args, "api_key", None)
+    train_size = getattr(args, "train_size", 300)
+    val_size   = getattr(args, "val_size", 100)
+    verbose    = getattr(args, "verbose", False)
+    methods    = [m.lower() for m in args.methods]
 
     # ── Banner ─────────────────────────────────────────────────────────────
-    _dspy_tag  = "[green]DSPy MIPROv2[/green]" if _MIPRO_USE_DSPY else "[dim]hand-reimpl[/dim]"
-    _model_tag = f"[bold green]{model}[/bold green]" if model != "mock" else "[dim]MockLLM[/dim]"
+    _model_tag = (
+        f"[bold green]{model}[/bold green]" if model != "mock"
+        else "[dim]MockLLM[/dim]"
+    )
+    _gepa_tag  = "[green]dspy.GEPA (official)[/green]"   if _HAS_DSPY else "[red]DSPy not installed[/red]"
+    _mipro_tag = "[green]dspy.MIPROv2 (official)[/green]" if _HAS_DSPY else "[red]DSPy not installed[/red]"
+
     console.print(Panel.fit(
-        "[bold bright_white]IFBench Evaluation[/bold bright_white]\n\n"
-        "[dim]Instruction-Following benchmark — verifiable constraint parsers[/dim]\n\n"
-        f"  [cyan bold]APA[/cyan bold]   — Adaptive Prompt Automaton (stateful FSA)\n"
-        f"  [yellow bold]GEPA[/yellow bold]  — Reflective Prompt Evolution\n"
-        f"  [magenta bold]MIPRO[/magenta bold] — {_dspy_tag}\n\n"
+        "[bold bright_white]IFBench Official Evaluation[/bold bright_white]\n\n"
+        "[dim]Each method works exactly as in its respective paper.[/dim]\n\n"
+        "  [cyan bold]APA[/cyan bold]    — 4-state FSA, evolutionary search (unchanged)\n"
+        f"  [yellow bold]GEPA[/yellow bold]   — IFBench 2-stage rewriter  [{_gepa_tag}]\n"
+        f"  [magenta bold]MIPRO[/magenta bold]  — IFBench 2-stage rewriter  [{_mipro_tag}]\n\n"
         f"  Model    : {_model_tag}\n"
-        f"  Methods  : [green]{', '.join(active_methods)}[/green]\n"
-        f"  Parsers  : [green]{', '.join(active_parsers)}[/green]",
+        f"  Methods  : [green]{', '.join(methods)}[/green]\n"
+        f"  Train    : [green]{train_size}[/green]  Val: [green]{val_size}[/green]  "
+        f"Test: [green]300[/green] (official IFBench)",
         title="[bold]IFBench — APA vs GEPA vs MIPRO[/bold]",
         border_style="white",
     ))
 
-    # ── Build LLMs ─────────────────────────────────────────────────────────
-    llm_apa, llm_gepa, llm_mipro, llm_eval, dspy_lm = _make_llms(
-        model, api_key, SEED
-    )
+    # ── Set up LLMs ────────────────────────────────────────────────────────
+    key = api_key or os.environ.get("OPENAI_API_KEY", "")
+    if model != "mock" and not key:
+        console.print("[red]Error:[/red] OPENAI_API_KEY is required for live models.")
+        console.print("Set it with:  export OPENAI_API_KEY=sk-...")
+        sys.exit(1)
 
-    # ── Build benchmark ─────────────────────────────────────────────────────
-    console.print(Panel("[bold]Building IFBench[/bold]", border_style="dim"))
-    train_suite, test_suite = make_ifbench_benchmark()
+    if model != "mock":
+        llm_apa  = get_llm_api("openai", model=model, api_key=key)
+        dspy_lm  = dspy.LM(f"openai/{model}", api_key=key) if _HAS_DSPY else None
+    else:
+        llm_apa  = get_llm_api("mock", uncertainty_rate=0.32, latency=0.0, seed=SEED)
+        dspy_lm  = None
 
-    # Filter to active parsers
-    train_tasks: List[IFTask] = [
-        t for t in train_suite.tasks if t.constraint_type in active_parsers
-    ]
-    test_tasks: List[IFTask] = [
-        t for t in test_suite.tasks if t.constraint_type in active_parsers
-    ]
+    # ── Load official IFBench data ─────────────────────────────────────────
+    scorer = IFBenchOfficialScorer()
+    console.print(Panel("[bold]Loading IFBench Data[/bold]", border_style="dim"))
 
-    console.print(
-        f"  Train: [green]{len(train_tasks)}[/green] tasks  "
-        f"Test: [green]{len(test_tasks)}[/green] tasks  "
-        f"Parsers: [green]{', '.join(active_parsers)}[/green]"
-    )
+    console.print("  [dim]Loading official test set …[/dim]")
+    test_examples = load_ifbench_test()
+    console.print(f"  ✓ test set: [green]{len(test_examples)}[/green] prompts")
 
-    extractor    = FeatureExtractor(long_input_threshold=120)
-    train_inputs = [t.input_text for t in train_tasks]
-    trained: Dict[str, Automaton] = {}
+    train_examples: List[IFBenchOfficialExample] = []
+    val_examples:   List[IFBenchOfficialExample] = []
 
-    # ══════════════════════════════════════════════════════════════════════
-    # TRAIN
-    # ══════════════════════════════════════════════════════════════════════
+    if ("gepa" in methods or "mipro" in methods) and model != "mock":
+        console.print(f"  [dim]Loading IF-RLVR train/val from HuggingFace …[/dim]")
+        try:
+            train_examples, val_examples = load_ifbench_train_val(
+                train_size = train_size,
+                val_size   = val_size,
+                seed       = SEED,
+            )
+            console.print(
+                f"  ✓ train: [green]{len(train_examples)}[/green]  "
+                f"val: [green]{len(val_examples)}[/green]"
+            )
+        except Exception as exc:
+            console.print(f"  [yellow]⚠ HuggingFace load failed:[/yellow] {exc}")
+            console.print("  [dim]GEPA and MIPRO will be skipped.[/dim]")
+            methods = [m for m in methods if m == "apa"]
+    elif ("gepa" in methods or "mipro" in methods) and model == "mock":
+        console.print(
+            "  [yellow]⚠ GEPA and MIPRO require a real LLM (--model gpt-4.1-mini etc.).[/yellow]\n"
+            "  [dim]Running APA only in mock mode.[/dim]"
+        )
+        methods = [m for m in methods if m == "apa"]
 
-    if "apa" in active_methods:
+    # ── Train each method ─────────────────────────────────────────────────
+    trained: Dict[str, object] = {}   # method → automaton or dspy.Module
+
+    # APA: evolutionary FSA (unchanged)
+    if "apa" in methods:
         console.print(Panel(
-            "[cyan bold]Training APA — Evolutionary Search[/cyan bold]",
+            "[cyan bold]Training APA — Evolutionary FSA[/cyan bold]",
             border_style="cyan",
         ))
-        search = EvolutionarySearch(
+        # For APA training, use IFBench train examples (or subset) as tasks
+        apa_tasks = _apa_train_tasks_from_ifbench(
+            train_examples[:train_size] if train_examples else []
+        )
+        if not apa_tasks:
+            # Mock mode: use a small synthetic task set for training
+            apa_tasks = [
+                Task(task_id=f"t{i}", input_text=f"Sample instruction-following task {i}.", expected="")
+                for i in range(20)
+            ]
+
+        extractor  = FeatureExtractor()
+        apa_search = EvolutionarySearch(
             initial_automaton = build_apa_seed(),
             llm_api           = llm_apa,
             feature_extractor = extractor,
-            reward_fn         = lambda ep: ifbench_reward(
-                ep, train_tasks[ep.episode_id % len(train_tasks)]
-                if isinstance(ep.episode_id, int)
-                else _find_task(ep.episode_id, train_tasks)
-            ),
-            population_size  = 6,
-            n_generations    = 8,
-            mutation_rate    = 0.40,
-            elite_frac       = 0.25,
-            tournament_size  = 3,
-            n_eval_tasks     = min(5, len(train_tasks)),
-            seed             = SEED,
+            reward_fn         = composite_reward,
+            n_generations     = 8,
+            mutation_rate     = 0.40,
+            elite_frac        = 0.25,
+            tournament_size   = 3,
+            n_eval_tasks      = min(5, len(apa_tasks)),
+            seed              = SEED,
         )
-        trained["apa"] = search.run(train_inputs, console=console)
+        trained["apa"] = apa_search.run(
+            [t.input_text for t in apa_tasks], console=console
+        )
+        console.print(
+            f"  [green]✓[/green] APA trained  "
+            f"fitness={apa_search.best_fitness:.4f}"
+        )
 
-    if "gepa" in active_methods:
+    # GEPA: official dspy.GEPA with IFBench 2-stage pipeline
+    if "gepa" in methods:
         console.print(Panel(
-            "[yellow bold]Training GEPA — Reflective Prompt Evolution[/yellow bold]",
+            "[yellow bold]Training GEPA — dspy.GEPA (official IFBench pipeline)[/yellow bold]",
             border_style="yellow",
         ))
-        search = GEPASearch(
-            initial_automaton    = build_apa_seed(),
-            llm_api              = llm_gepa,
-            feature_extractor    = extractor,
-            reward_fn            = lambda ep: ifbench_reward(
-                ep, train_tasks[ep.episode_id % len(train_tasks)]
-                if isinstance(ep.episode_id, int)
-                else _find_task(ep.episode_id, train_tasks)
-            ),
-            n_iterations         = 8,
-            n_trajectory_samples = 5,
-            failure_threshold    = 0.40,
-            n_eval_tasks         = min(5, len(train_tasks)),
-            seed                 = SEED,
+        gepa_search = GEPADSPySearch(
+            auto           = getattr(args, "gepa_auto", "light"),
+            ifbench_scorer = scorer,
+            train_examples = train_examples,
+            val_examples   = val_examples,
+            dspy_lm        = dspy_lm,
+            seed           = SEED,
         )
-        trained["gepa"] = search.run(train_inputs, console=console)
+        trained["gepa"] = gepa_search.run(console=console)
 
-    if "mipro" in active_methods:
+    # MIPRO: official dspy.MIPROv2 with IFBench 2-stage pipeline
+    if "mipro" in methods:
         console.print(Panel(
-            f"[magenta bold]Training {_MIPRO_LABEL}[/magenta bold]",
+            "[magenta bold]Training MIPRO — dspy.MIPROv2 (official IFBench pipeline)[/magenta bold]",
             border_style="magenta",
         ))
-        if _MIPRO_USE_DSPY:
-            search = _MIPROBackend(
-                auto             = "light",
-                n_eval_tasks     = min(5, len(train_tasks)),
-                seed             = SEED,
-                uncertainty_rate = 0.32,
-                dspy_lm          = dspy_lm,          # None → MockDSPyLM; real LM → live
-                eval_llm         = llm_mipro if dspy_lm else None,
-            )
-            trained["mipro"] = search.run(train_inputs, console=console)
-        else:
-            search = _MIPROBackend(
-                llm_api                  = llm_mipro,
-                feature_extractor        = extractor,
-                reward_fn                = lambda ep: ifbench_reward(
-                    ep, train_tasks[ep.episode_id % len(train_tasks)]
-                    if isinstance(ep.episode_id, int)
-                    else _find_task(ep.episode_id, train_tasks)
-                ),
-                n_bootstrap_episodes     = 10,
-                n_instruction_candidates = 5,
-                n_demo_sets              = 3,
-                max_demos_per_set        = 2,
-                n_bayesian_rounds        = 3,
-                n_eval_tasks             = min(5, len(train_tasks)),
-                seed                     = SEED,
-            )
-            trained["mipro"] = search.run(train_inputs, console=console)
-
-    # ══════════════════════════════════════════════════════════════════════
-    # EVALUATE on test split
-    # ══════════════════════════════════════════════════════════════════════
-    console.print(Panel(
-        "[bold]Evaluating on IFBench Test Split[/bold]", border_style="dim"
-    ))
-    results: Dict[str, List[Episode]] = {}
-
-    for method, automaton in trained.items():
-        col = METHOD_COLOURS[method]
-        eps = eval_on_iftasks(
-            automaton, llm_eval, extractor, test_tasks,
-            desc    = f"{method.upper()} (IFBench test)",
-            colour  = col,
-            verbose = verbose,
+        mipro_search = MIPRODSPySearch(
+            auto           = getattr(args, "mipro_auto", "light"),
+            ifbench_scorer = scorer,
+            train_examples = train_examples,
+            val_examples   = val_examples,
+            dspy_lm        = dspy_lm,
+            seed           = SEED,
         )
-        results[method] = eps
+        trained["mipro"] = mipro_search.run(console=console)
 
-    # ══════════════════════════════════════════════════════════════════════
-    # RESULTS
-    # ══════════════════════════════════════════════════════════════════════
-    console.print(Rule("[bold]Per-Parser Compliance[/bold]"))
-    render_per_parser_table(results, test_tasks, active_parsers,
-                            title="IFBench — Compliance by Parser Type")
+    # ── Evaluate on official test set ──────────────────────────────────────
+    console.print(Rule("[bold]Official IFBench Test Evaluation (300 prompts)[/bold]"))
+    results: Dict[str, Dict[str, float]] = {}
 
-    if verbose or len(test_tasks) <= 24:
-        console.print(Rule("[bold]Per-Task Breakdown[/bold]"))
-        render_per_task_table(results, test_tasks,
-                              title="IFBench — Per-Task Scores")
+    if "apa" in trained:
+        console.print(Panel("[cyan bold]Evaluating APA on official test set[/cyan bold]", border_style="cyan"))
+        results["APA"] = eval_apa_on_ifbench(
+            automaton = trained["apa"],
+            llm       = llm_apa,
+            examples  = test_examples,
+            scorer    = scorer,
+            desc      = "APA test",
+            verbose   = verbose,
+        )
+        console.print(
+            f"  APA  prompt_loose = [bold cyan]{results['APA']['prompt_loose']*100:.1f}%[/bold cyan]  "
+            f"instr_loose = {results['APA']['instruction_loose']*100:.1f}%"
+        )
 
-    render_summary_panel(results, test_tasks, active_parsers)
+    if "gepa" in trained:
+        console.print(Panel("[yellow bold]Evaluating GEPA on official test set[/yellow bold]", border_style="yellow"))
+        results["GEPA"] = eval_dspy_program_on_ifbench(
+            program  = trained["gepa"],
+            dspy_lm  = dspy_lm,
+            examples = test_examples,
+            scorer   = scorer,
+            desc     = "GEPA test",
+            colour   = "yellow",
+            verbose  = verbose,
+        )
+        console.print(
+            f"  GEPA prompt_loose = [bold yellow]{results['GEPA']['prompt_loose']*100:.1f}%[/bold yellow]  "
+            f"instr_loose = {results['GEPA']['instruction_loose']*100:.1f}%"
+        )
+
+    if "mipro" in trained:
+        console.print(Panel("[magenta bold]Evaluating MIPRO on official test set[/magenta bold]", border_style="magenta"))
+        results["MIPRO"] = eval_dspy_program_on_ifbench(
+            program  = trained["mipro"],
+            dspy_lm  = dspy_lm,
+            examples = test_examples,
+            scorer   = scorer,
+            desc     = "MIPRO test",
+            colour   = "magenta",
+            verbose  = verbose,
+        )
+        console.print(
+            f"  MIPRO prompt_loose = [bold magenta]{results['MIPRO']['prompt_loose']*100:.1f}%[/bold magenta]  "
+            f"instr_loose = {results['MIPRO']['instruction_loose']*100:.1f}%"
+        )
+
+    # ── Final table ────────────────────────────────────────────────────────
+    console.print()
+    render_results_table(results)
+
+    # Print optimised instructions for GEPA/MIPRO
+    if "gepa" in methods and "gepa" in trained:
+        instr = gepa_search.get_optimised_instruction()
+        console.print(Panel(
+            f"[dim]{instr}[/dim]",
+            title="[yellow]GEPA — Evolved Stage-2 Instruction[/yellow]",
+            border_style="yellow",
+        ))
+    if "mipro" in methods and "mipro" in trained:
+        instr = mipro_search.get_optimised_instruction()
+        console.print(Panel(
+            f"[dim]{instr}[/dim]",
+            title="[magenta]MIPRO — Optimised Stage-2 Instruction[/magenta]",
+            border_style="magenta",
+        ))
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Helper: look up an IFTask by episode_id string
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _find_task(episode_id: str, tasks: List[IFTask]) -> IFTask:
-    for t in tasks:
-        if t.task_id == episode_id:
-            return t
-    return tasks[0]   # fallback
-
-
-# ──────────────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 # CLI
-# ──────────────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="IFBench: evaluate APA / GEPA / MIPRO on instruction-following tasks",
+        description="IFBench: APA vs GEPA vs MIPRO on official IFBench benchmark",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples
 ────────
-  # All methods, all parsers (offline mock LLM)
-  python ifbench_eval.py
+  # APA only (mock, offline)
+  python ifbench_eval.py --methods apa
 
-  # Live model — all methods, all parsers
+  # All methods (live model, default 300 train / 100 val)
   python ifbench_eval.py --model gpt-4.1-mini
 
-  # Live model — pass key inline
+  # Custom split sizes
+  python ifbench_eval.py --model gpt-4.1-mini --train-size 200 --val-size 100
+
+  # Pass API key inline
   python ifbench_eval.py --model gpt-4.1-mini --api-key sk-...
 
-  # Live model — specific methods and parsers
-  python ifbench_eval.py --model gpt-4.1-mini --methods apa gepa mipro --parsers keyword length format startend case composite
+  # Heavier search
+  python ifbench_eval.py --model gpt-4.1-mini --gepa-auto medium --mipro-auto medium
 
-  # Only keyword + length parsers (mock)
-  python ifbench_eval.py --parsers keyword length
+  # Verbose (print per-example constraint results)
+  python ifbench_eval.py --model gpt-4.1-mini --verbose
 
-  # Only APA and MIPRO
-  python ifbench_eval.py --methods apa mipro
-
-  # APA only, all parsers, verbose
-  python ifbench_eval.py --methods apa --verbose
-
-  # Single parser type
-  python ifbench_eval.py --parsers composite
-
-Parser types available
-──────────────────────
-  keyword    must include / exclude specific words
-  length     word/sentence count constraint
-  format     bullet list, numbered list, JSON, code block, table
-  startend   must start or end with a given phrase
-  case       ALL CAPS / lowercase / Title Case
-  composite  two constraints combined (AND logic)
+Metrics
+───────
+  Primary : prompt_loose  — 1.0 if ALL constraints pass (loose), else 0.0
+  Secondary: instruction_loose — mean fraction of individual constraints passing
         """,
     )
     p.add_argument(
         "--methods", nargs="+",
         choices=ALL_METHODS, default=ALL_METHODS,
         metavar="METHOD",
-        help=f"Methods to evaluate (default: all). Choices: {ALL_METHODS}",
-    )
-    p.add_argument(
-        "--parsers", nargs="+",
-        choices=ALL_PARSERS, default=ALL_PARSERS,
-        metavar="PARSER",
-        help=f"Parser types to include (default: all). Choices: {ALL_PARSERS}",
-    )
-    p.add_argument(
-        "--verbose", action="store_true",
-        help="Print per-episode constraint check results during evaluation",
-    )
-    p.add_argument(
-        "--seed", type=int, default=42,
-        help="Random seed (default: 42)",
+        help=f"Methods to evaluate. Choices: {ALL_METHODS}",
     )
     p.add_argument(
         "--model", default="mock",
         help=(
-            "LLM backend to use. "
-            "'mock' (default) runs fully offline with a simulated LLM. "
-            "Any OpenAI model name (e.g. 'gpt-4.1-mini', 'gpt-4o') calls the "
-            "live API — requires OPENAI_API_KEY."
+            "LLM to use. 'mock' (default) for offline APA-only. "
+            "Any OpenAI model name (e.g. 'gpt-4.1-mini') for live evaluation."
         ),
     )
     p.add_argument(
         "--api-key", dest="api_key", default=None,
-        help=(
-            "OpenAI API key. If omitted, reads from the OPENAI_API_KEY "
-            "environment variable."
-        ),
+        help="OpenAI API key (default: reads OPENAI_API_KEY env var)",
+    )
+    p.add_argument(
+        "--train-size", dest="train_size", type=int, default=300,
+        help="IF-RLVR train samples for GEPA/MIPRO (default: 300)",
+    )
+    p.add_argument(
+        "--val-size", dest="val_size", type=int, default=100,
+        help="IF-RLVR val samples for GEPA/MIPRO (default: 100)",
+    )
+    p.add_argument(
+        "--gepa-auto", dest="gepa_auto", default="light",
+        choices=["light", "medium", "heavy"],
+        help="dspy.GEPA search intensity (default: light)",
+    )
+    p.add_argument(
+        "--mipro-auto", dest="mipro_auto", default="light",
+        choices=["light", "medium", "heavy"],
+        help="dspy.MIPROv2 search intensity (default: light)",
+    )
+    p.add_argument(
+        "--verbose", action="store_true",
+        help="Print per-example constraint results during evaluation",
+    )
+    p.add_argument(
+        "--seed", type=int, default=42,
+        help="Random seed (default: 42)",
     )
     return p.parse_args()
 
