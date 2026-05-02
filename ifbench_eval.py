@@ -320,25 +320,69 @@ def render_summary_panel(
 # Main
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _make_llms(model: str, api_key: Optional[str], seed: int):
+    """
+    Return (llm_apa, llm_gepa, llm_mipro, llm_eval, dspy_lm).
+
+    model == "mock"  → MockLLM for APA/GEPA/eval, MockDSPyLM for MIPRO (default)
+    otherwise        → OpenAILLM(model) for APA/GEPA/eval, dspy.LM for MIPRO
+    """
+    if model == "mock":
+        llm_apa   = get_llm_api("mock", uncertainty_rate=0.32, latency=0.0, seed=seed)
+        llm_gepa  = get_llm_api("mock", uncertainty_rate=0.32, latency=0.0, seed=seed)
+        llm_mipro = get_llm_api("mock", uncertainty_rate=0.32, latency=0.0, seed=seed)
+        llm_eval  = get_llm_api("mock", uncertainty_rate=0.32, latency=0.0, seed=seed)
+        dspy_lm   = None   # MIPRODSPySearch creates MockDSPyLM internally
+    else:
+        import os
+        key = api_key or os.environ.get("OPENAI_API_KEY")
+        if not key:
+            raise ValueError(
+                "OPENAI_API_KEY is required.\n"
+                "Set it via:  export OPENAI_API_KEY=sk-...  or pass --api-key SK..."
+            )
+        llm_apa   = get_llm_api("openai", model=model, api_key=key)
+        llm_gepa  = get_llm_api("openai", model=model, api_key=key)
+        llm_eval  = get_llm_api("openai", model=model, api_key=key)
+        llm_mipro = llm_eval   # unused in DSPy path
+        try:
+            import dspy as _dspy
+            dspy_lm = _dspy.LM(f"openai/{model}", api_key=key)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to create dspy.LM for {model!r}: {exc}"
+            ) from exc
+
+    return llm_apa, llm_gepa, llm_mipro, llm_eval, dspy_lm
+
+
 def main(args: argparse.Namespace) -> None:
-    active_methods  = args.methods
-    active_parsers  = args.parsers
-    verbose         = args.verbose
+    active_methods = args.methods
+    active_parsers = args.parsers
+    verbose        = args.verbose
+    model          = args.model
+    api_key        = getattr(args, "api_key", None)
 
     # ── Banner ─────────────────────────────────────────────────────────────
-    _dspy_tag = "[green]DSPy MIPROv2[/green]" if _MIPRO_USE_DSPY else "[dim]hand-reimpl[/dim]"
+    _dspy_tag  = "[green]DSPy MIPROv2[/green]" if _MIPRO_USE_DSPY else "[dim]hand-reimpl[/dim]"
+    _model_tag = f"[bold green]{model}[/bold green]" if model != "mock" else "[dim]MockLLM[/dim]"
     console.print(Panel.fit(
         "[bold bright_white]IFBench Evaluation[/bold bright_white]\n\n"
-        "[dim]Instruction-Following benchmark — verifiable constraint parsers\n"
-        "Same MockLLM, same seed, deterministic scoring.[/dim]\n\n"
+        "[dim]Instruction-Following benchmark — verifiable constraint parsers[/dim]\n\n"
         f"  [cyan bold]APA[/cyan bold]   — Adaptive Prompt Automaton (stateful FSA)\n"
         f"  [yellow bold]GEPA[/yellow bold]  — Reflective Prompt Evolution\n"
         f"  [magenta bold]MIPRO[/magenta bold] — {_dspy_tag}\n\n"
+        f"  Model    : {_model_tag}\n"
         f"  Methods  : [green]{', '.join(active_methods)}[/green]\n"
         f"  Parsers  : [green]{', '.join(active_parsers)}[/green]",
         title="[bold]IFBench — APA vs GEPA vs MIPRO[/bold]",
         border_style="white",
     ))
+
+    # ── Build LLMs ─────────────────────────────────────────────────────────
+    llm_apa, llm_gepa, llm_mipro, llm_eval, dspy_lm = _make_llms(
+        model, api_key, SEED
+    )
 
     # ── Build benchmark ─────────────────────────────────────────────────────
     console.print(Panel("[bold]Building IFBench[/bold]", border_style="dim"))
@@ -358,14 +402,8 @@ def main(args: argparse.Namespace) -> None:
         f"Parsers: [green]{', '.join(active_parsers)}[/green]"
     )
 
-    extractor = FeatureExtractor(long_input_threshold=120)
-    llm_apa   = get_llm_api("mock", uncertainty_rate=0.32, latency=0.0, seed=SEED)
-    llm_gepa  = get_llm_api("mock", uncertainty_rate=0.32, latency=0.0, seed=SEED)
-    llm_mipro = get_llm_api("mock", uncertainty_rate=0.32, latency=0.0, seed=SEED)
-    llm_eval  = get_llm_api("mock", uncertainty_rate=0.32, latency=0.0, seed=SEED)
-
+    extractor    = FeatureExtractor(long_input_threshold=120)
     train_inputs = [t.input_text for t in train_tasks]
-
     trained: Dict[str, Automaton] = {}
 
     # ══════════════════════════════════════════════════════════════════════
@@ -429,6 +467,8 @@ def main(args: argparse.Namespace) -> None:
                 n_eval_tasks     = min(5, len(train_tasks)),
                 seed             = SEED,
                 uncertainty_rate = 0.32,
+                dspy_lm          = dspy_lm,          # None → MockDSPyLM; real LM → live
+                eval_llm         = llm_mipro if dspy_lm else None,
             )
             trained["mipro"] = search.run(train_inputs, console=console)
         else:
@@ -505,10 +545,19 @@ def parse_args() -> argparse.Namespace:
         epilog="""
 Examples
 ────────
-  # All methods, all parsers
+  # All methods, all parsers (offline mock LLM)
   python ifbench_eval.py
 
-  # Only keyword + length parsers
+  # Live model — all methods, all parsers
+  python ifbench_eval.py --model gpt-4.1-mini
+
+  # Live model — pass key inline
+  python ifbench_eval.py --model gpt-4.1-mini --api-key sk-...
+
+  # Live model — specific methods and parsers
+  python ifbench_eval.py --model gpt-4.1-mini --methods apa gepa mipro --parsers keyword length format startend case composite
+
+  # Only keyword + length parsers (mock)
   python ifbench_eval.py --parsers keyword length
 
   # Only APA and MIPRO
@@ -549,6 +598,22 @@ Parser types available
     p.add_argument(
         "--seed", type=int, default=42,
         help="Random seed (default: 42)",
+    )
+    p.add_argument(
+        "--model", default="mock",
+        help=(
+            "LLM backend to use. "
+            "'mock' (default) runs fully offline with a simulated LLM. "
+            "Any OpenAI model name (e.g. 'gpt-4.1-mini', 'gpt-4o') calls the "
+            "live API — requires OPENAI_API_KEY."
+        ),
+    )
+    p.add_argument(
+        "--api-key", dest="api_key", default=None,
+        help=(
+            "OpenAI API key. If omitted, reads from the OPENAI_API_KEY "
+            "environment variable."
+        ),
     )
     return p.parse_args()
 

@@ -421,6 +421,38 @@ def _wrap_automaton(optimised_program: "APADSPyProgram") -> Automaton:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# _DSPyLLMAdapter — wraps a real dspy.LM as an APA-compatible .call() LLM
+# ──────────────────────────────────────────────────────────────────────────────
+
+class _DSPyLLMAdapter:
+    """
+    Thin adapter: wraps any dspy.LM so it exposes the APA .call() interface.
+
+    Used as eval_llm when MIPRODSPySearch is given a real dspy.LM but no
+    explicit APA-compatible eval_llm.  The dspy.LM is called via its
+    __call__ method with a plain user message.
+    """
+
+    def __init__(self, dspy_lm):
+        self._lm        = dspy_lm
+        self.call_count = 0
+
+    def call(self, prompt: str, role: str = "user", max_tokens: int = 256):
+        self.call_count += 1
+        try:
+            outputs = self._lm(
+                messages   = [{"role": "user", "content": prompt}],
+                max_tokens = max_tokens,
+            )
+            text = outputs[0] if outputs else ""
+            if isinstance(text, dict):
+                text = text.get("text", "")
+        except Exception:
+            text = ""
+        return text, len(str(text).split()) + 10
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # MIPRODSPySearch — public API (mirrors MIPROSearch.run interface)
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -434,13 +466,20 @@ class MIPRODSPySearch:
     ──────────
     auto : str
         MIPROv2 search intensity: 'light' | 'medium' | 'heavy'.
-        'light' completes quickly and is sufficient for MockLLM benchmarks.
     n_eval_tasks : int
         Number of training tasks to use as the MIPROv2 trainset.
     seed : int
         Random seed for reproducibility.
     uncertainty_rate : float
-        MockLLM uncertainty injection rate (0–1).
+        MockLLM uncertainty injection rate (0–1). Only used when dspy_lm is None.
+    dspy_lm : dspy.BaseLM or None
+        Optional pre-built DSPy LM to use instead of MockDSPyLM.
+        Pass a real dspy.LM("openai/gpt-4.1-mini") here for live evaluation.
+        When provided, eval_llm should also be set.
+    eval_llm : object or None
+        APA-compatible LLM (has .call(prompt) → (str, int)) used for the
+        fitness probe and episode evaluation.  If None and dspy_lm is set,
+        a lightweight adapter wraps dspy_lm for APA compatibility.
     """
 
     def __init__(
@@ -449,6 +488,8 @@ class MIPRODSPySearch:
         n_eval_tasks:     int   = 5,
         seed:             int   = 42,
         uncertainty_rate: float = 0.15,
+        dspy_lm           = None,   # real dspy.LM for live runs
+        eval_llm          = None,   # APA-compatible LLM for fitness probe
     ):
         if not _HAS_DSPY:
             raise ImportError(
@@ -460,16 +501,21 @@ class MIPRODSPySearch:
         self.seed             = seed
         self.uncertainty_rate = uncertainty_rate
 
-        # Shared MockLLM used for both DSPy calls and metric evaluation
-        self._mock_llm = MockLLM(
-            uncertainty_rate = uncertainty_rate,
-            seed             = seed,
-        )
-        self._dspy_lm = MockDSPyLM(
-            uncertainty_rate = uncertainty_rate,
-            latency          = 0.0,
-            seed             = seed,
-        )
+        if dspy_lm is not None:
+            # Real LM path — use the provided dspy.LM directly
+            self._dspy_lm  = dspy_lm
+            self._mock_llm = eval_llm or _DSPyLLMAdapter(dspy_lm)
+        else:
+            # Mock path (default)
+            self._mock_llm = MockLLM(
+                uncertainty_rate = uncertainty_rate,
+                seed             = seed,
+            )
+            self._dspy_lm = MockDSPyLM(
+                uncertainty_rate = uncertainty_rate,
+                latency          = 0.0,
+                seed             = seed,
+            )
 
     # ------------------------------------------------------------------
     # Public interface
