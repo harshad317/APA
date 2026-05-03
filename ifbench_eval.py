@@ -374,7 +374,7 @@ def _make_fingerprint_fn(
     fingerprint_fn(task_input, response) → float ∈ [0, 1]
     """
     prompt_to_example: Dict[str, IFBenchOfficialExample] = {
-        ex.prompt: ex for ex in probe_examples
+        ex.to_apa_task_input(): ex for ex in probe_examples
     }
 
     def fingerprint_fn(task_input: str, response: str) -> float:
@@ -389,11 +389,16 @@ def _make_fingerprint_fn(
 def _apa_train_tasks_from_ifbench(
     examples: List[IFBenchOfficialExample],
 ) -> List[Task]:
-    """Wrap IFBench examples as APA Task objects for evolutionary training."""
+    """Wrap IFBench examples as APA Task objects for evolutionary training.
+
+    Uses to_apa_task_input() which augments the raw prompt with a structured
+    constraint checklist — giving APA the same explicit constraint inventory
+    that GEPA passes as a separate field to its stage-2 rewriter.
+    """
     return [
         Task(
             task_id    = ex.key,
-            input_text = ex.prompt,
+            input_text = ex.to_apa_task_input(),
             expected   = "",
             category   = "ifbench",
             difficulty = "medium",
@@ -470,7 +475,7 @@ def _make_ifbench_episode_reward(
       Good pass (4/5 constraints, structured):        ≈ 0.00 + 0.44 + 0.13 + 0.10 = 0.67
       Full pass (all constraints):                    ≈ 0.20 + 0.55 + 0.13 + 0.10 = 0.98
     """
-    by_prompt = {ex.prompt: ex for ex in examples}
+    by_prompt = {ex.to_apa_task_input(): ex for ex in examples}
 
     def reward(episode: Episode) -> float:
         ex = by_prompt.get(episode.task_input)
@@ -524,7 +529,7 @@ def eval_apa_on_ifbench(
             llm_api           = llm,
             feature_extractor = extractor,
         )
-        episode  = _exec.run_episode(ex.prompt, verbose=False)
+        episode  = _exec.run_episode(ex.to_apa_task_input(), verbose=False)
         response = episode.final_output or ""
         pl = scorer.prompt_loose(example=ex, response=response)
         il = scorer.instruction_loose(example=ex, response=response)
@@ -752,7 +757,7 @@ def run_apa(
             f"(fixed for full run — Fixes 2/4/5)[/dim]"
         )
 
-    probe_task_inputs = [ex.prompt for ex in probe_examples] if probe_examples else None
+    probe_task_inputs = [ex.to_apa_task_input() for ex in probe_examples] if probe_examples else None
 
     # ── Fallback fingerprinting when no HuggingFace train data ───────────────
     # When datasets is not installed, probe_pool is empty → probe_examples is

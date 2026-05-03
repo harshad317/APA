@@ -87,6 +87,44 @@ class IFBenchOfficialExample:
             parts.append(f"{inst_id}: {json.dumps(clean_kw)}")
         return " | ".join(parts) if parts else "(no constraints)"
 
+    def to_apa_task_input(self) -> str:
+        """
+        Return the task input string for APA — the raw prompt augmented with
+        a structured constraint checklist.
+
+        GEPA provides constraint_text as an explicit third field to its
+        stage-2 rewriter.  APA receives a single task_input string, so we
+        embed the structured constraint metadata directly in the prompt text.
+        This gives the APA rewrite state the same explicit constraint
+        inventory that GEPA uses, improving satisfaction of format, count,
+        keyword, and other precisely-specified constraints.
+
+        Format:
+          <raw prompt>
+
+          ---
+          Required constraints (ALL must be satisfied):
+          • <constraint_id>: {<params>}
+          ...
+
+        The "---" separator makes the constraint block visually distinct from
+        the freeform query so the model can address both independently.
+        """
+        if not self.instruction_id_list:
+            return self.prompt
+
+        lines: List[str] = []
+        for inst_id, kw in zip(self.instruction_id_list, self.kwargs):
+            clean_kw = {k: v for k, v in kw.items() if v is not None}
+            lines.append(f"  • {inst_id}: {json.dumps(clean_kw)}")
+
+        constraint_block = (
+            "\n\n---\n"
+            "Required constraints (ALL must be satisfied):\n"
+            + "\n".join(lines)
+        )
+        return self.prompt + constraint_block
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Scorer
