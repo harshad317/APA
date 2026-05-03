@@ -421,22 +421,42 @@ def _make_ifbench_episode_reward(
 
     Three complementary signals are blended:
 
-      0.45 × prompt_score      — primary: all constraints fully satisfied (binary)
-      0.15 × instr_score       — partial credit: fraction of constraints passed
-      0.32 × composite_reward  — smooth baseline: word count, punctuation, no hedging
-      0.08 × reasoning_bonus   — structured constraint-analysis language present
+      0.20 × prompt_score      — binary: all constraints fully satisfied (rare on IF-RLVR)
+      0.55 × instr_score       — PRIMARY: fraction of individual constraints passed
+      0.15 × composite_reward  — smooth baseline: word count, punctuation, no hedging
+      0.10 × reasoning_bonus   — structured constraint-analysis language present
 
-    The reasoning_bonus rewards responses that contain explicit constraint-analysis
-    language (e.g. "Step 1:", "verified", "each constraint").  This is path-
-    independent — it measures what the model actually wrote, not which FSA state
-    produced it — and directly correlates with IFBench pass rates because
-    constraint-enumerating responses are more likely to satisfy all requirements.
+    Weight rationale (re-calibrated after observing actual run behaviour):
+    ─────────────────────────────────────────────────────────────────────
+    The IF-RLVR training pool contains prompts with up to 5 constraints.
+    gpt-4.1-mini passes ALL constraints (prompt_score=1) on ≈0% of these probe
+    tasks, so the original 0.45 × prompt_score term contributed ZERO signal to
+    template selection across all 12 training generations.
+
+    Only instr_score (fraction of individual constraints that pass) varies
+    meaningfully between templates — typically in the range [0.05, 0.20].
+    Under the original weights (0.15 × instr_score), this gave a fitness
+    discriminating range of just 0.022.  Under the new weights (0.55 ×
+    instr_score), the discriminating range is ≈0.082 — 4× wider — giving the
+    evolutionary search a real gradient to follow.
+
+    prompt_score is kept at 0.20 (not 0) so that if a template causes the model
+    to fully satisfy all constraints on even one probe task, that is strongly
+    rewarded and the individual propagates.
+
+    proxy weight is reduced to 0.15 because it is essentially constant (~0.85)
+    for all templates that produce substantive responses — it contributes a fixed
+    offset to fitness but no between-template discriminating signal.
+
+    reasoning_bonus is raised to 0.10 (from 0.08) to slightly reward templates
+    that elicit explicit constraint-analysis reasoning.
 
     Example fitness values (with n=20 probe tasks, official verifier):
-      Poorly-formatted response (fails all, terse):   ≈ 0.00 + 0.02 + 0.20 + 0.00 = 0.22
-      Well-formed response (fails all, structured):   ≈ 0.00 + 0.02 + 0.26 + 0.08 = 0.36
-      Partial pass (2/5 constraints, structured):     ≈ 0.00 + 0.06 + 0.26 + 0.08 = 0.40
-      Full pass (all constraints, structured):        ≈ 0.45 + 0.15 + 0.26 + 0.08 = 0.94
+      Terse response (fails all):                     ≈ 0.00 + 0.03 + 0.08 + 0.00 = 0.11
+      Structured, fails all (0/5 constraints):        ≈ 0.00 + 0.03 + 0.13 + 0.10 = 0.26
+      Partial pass (2/5 constraints, structured):     ≈ 0.00 + 0.22 + 0.13 + 0.10 = 0.45
+      Good pass (4/5 constraints, structured):        ≈ 0.00 + 0.44 + 0.13 + 0.10 = 0.67
+      Full pass (all constraints):                    ≈ 0.20 + 0.55 + 0.13 + 0.10 = 0.98
     """
     by_prompt = {ex.prompt: ex for ex in examples}
 
@@ -455,11 +475,11 @@ def _make_ifbench_episode_reward(
         # 0.08 weight is small enough to never override verifier signal yet
         # large enough to meaningfully separate structured from terse responses.
         lower            = response.lower()
-        reasoning_bonus  = 0.08 if any(m in lower for m in _REASONING_MARKERS) else 0.0
+        reasoning_bonus  = 0.10 if any(m in lower for m in _REASONING_MARKERS) else 0.0
 
-        return min(1.0, 0.45 * prompt_score
-                      + 0.15 * instr_score
-                      + 0.32 * proxy
+        return min(1.0, 0.20 * prompt_score
+                      + 0.55 * instr_score
+                      + 0.15 * proxy
                       + reasoning_bonus)
 
     return reward

@@ -338,12 +338,26 @@ class GEPADSPySearch:
                 seed          = self.seed,
             )
             with dspy.context(lm=self.dspy_lm):
-                optimised = optimiser.compile(
-                    student                    = student,
-                    trainset                   = trainset,
-                    valset                     = valset,
-                    requires_permission_to_run = False,
-                )
+                # requires_permission_to_run was removed from GEPA.compile() in
+                # the version shipped with this environment — pass only the args
+                # the installed API actually accepts.  Try without it first; if
+                # an older build raises an unexpected-kwarg error when it IS
+                # present, this branch handles both cases gracefully.
+                try:
+                    optimised = optimiser.compile(
+                        student  = student,
+                        trainset = trainset,
+                        valset   = valset,
+                    )
+                except TypeError as te:
+                    if "unexpected keyword" in str(te) or "valset" in str(te):
+                        # Even older build: try without valset
+                        optimised = optimiser.compile(
+                            student  = student,
+                            trainset = trainset,
+                        )
+                    else:
+                        raise
         except Exception as exc:
             console.print(f"  [yellow]⚠ dspy.GEPA raised:[/yellow] {exc!r}")
             console.print("  [dim]Falling back to base instruction.[/dim]")

@@ -384,13 +384,25 @@ class MIPRODSPySearch:
                 seed         = self.seed,
                 verbose      = False,
             )
-            with dspy.context(lm=self.dspy_lm):
-                optimised = optimiser.compile(
-                    student                    = student,
-                    trainset                   = trainset,
-                    valset                     = valset,
-                    requires_permission_to_run = False,
-                )
+            # MIPROv2 spawns worker processes (multiprocessing) internally.
+            # The dspy_lm carries DSPyAPICallCounter which holds threading.Lock
+            # — not picklable.  Strip callbacks before compile and restore after
+            # to avoid "cannot pickle '_thread.lock' object".
+            _callbacks_backup = list(getattr(self.dspy_lm, "callbacks", None) or [])
+            if hasattr(self.dspy_lm, "callbacks"):
+                self.dspy_lm.callbacks = []
+            try:
+                with dspy.context(lm=self.dspy_lm):
+                    optimised = optimiser.compile(
+                        student                    = student,
+                        trainset                   = trainset,
+                        valset                     = valset,
+                        requires_permission_to_run = False,
+                    )
+            finally:
+                # Always restore callbacks so the counter keeps working after
+                if hasattr(self.dspy_lm, "callbacks"):
+                    self.dspy_lm.callbacks = _callbacks_backup
         except Exception as exc:
             console.print(f"  [yellow]⚠ dspy.MIPROv2 raised:[/yellow] {exc!r}")
             console.print("  [dim]Falling back to base instruction.[/dim]")
