@@ -234,11 +234,117 @@ _VERIFY_BANK: List[str] = [
     ),
 ]
 
+# ──────────────────────────────────────────────────────────────────────────────
+# 2-state IFBench seed template banks  (draft → rewrite → terminal)
+# ──────────────────────────────────────────────────────────────────────────────
+# These support the 2-stage architecture that mirrors GEPA's IFBench pipeline.
+# State "draft"   : unconstrained answer generation (get content right first)
+# State "rewrite" : constraint-focused revision of the draft
+
+_DRAFT_BANK: List[str] = [
+    # 0 — Minimal direct (matches seed)
+    "Respond to the following query. Focus on content and accuracy.\n\n{input}",
+    # 1 — Expert role + content focus
+    (
+        "You are a knowledgeable assistant. Answer the following query accurately "
+        "and thoroughly. Focus on giving a complete, high-quality response.\n\n{input}"
+    ),
+    # 2 — Think then answer
+    (
+        "Think carefully about the following query, then provide a clear, accurate answer.\n\n"
+        "{input}\n\nAnswer:"
+    ),
+    # 3 — Content-first reminder
+    (
+        "Answer this query as completely and accurately as possible.\n"
+        "Focus on getting the content right — constraints will be checked in a revision pass.\n\n"
+        "{input}"
+    ),
+    # 4 — Step-through
+    (
+        "Work through the following query step by step, then provide your answer.\n\n{input}"
+    ),
+    # 5 — Direct
+    "{input}\n\nResponse:",
+    # 6 — Careful reader
+    (
+        "Read the following query carefully and respond with a complete, accurate answer.\n\n"
+        "{input}"
+    ),
+    # 7 — Reasoning emphasis
+    (
+        "Reason through the following query methodically, then give your best answer.\n\n{input}"
+    ),
+]
+
+_REWRITE_BANK: List[str] = [
+    # 0 — Constraint checklist + revise (matches seed)
+    (
+        "Revise the draft response below so that it satisfies EVERY "
+        "constraint stated in the original query.\n\n"
+        "Original query:\n{input}\n\n"
+        "Draft response:\n{context}\n\n"
+        "Check each constraint explicitly, then output the final "
+        "constraint-compliant response:"
+    ),
+    # 1 — PASS/FAIL audit framing
+    (
+        "Audit the draft against every constraint in the query.\n\n"
+        "Query:\n{input}\n\nDraft:\n{context}\n\n"
+        "For each constraint: mark PASS or FAIL.\n"
+        "Rewrite the response so all constraints are PASS.\n"
+        "Final constraint-compliant response:"
+    ),
+    # 2 — Numbered constraint mapping
+    (
+        "The query contains specific requirements. Satisfy every one of them.\n\n"
+        "Query:\n{input}\n\nDraft:\n{context}\n\n"
+        "1. List each requirement from the query.\n"
+        "2. Check whether the draft satisfies each.\n"
+        "3. Output the revised, fully compliant response:"
+    ),
+    # 3 — Expert reviewer persona
+    (
+        "As an expert reviewer, verify this draft satisfies every stated constraint.\n\n"
+        "Original query:\n{input}\n\nDraft to review:\n{context}\n\n"
+        "Issues found (if any):\nFinal corrected response:"
+    ),
+    # 4 — Minimal conditional fix
+    (
+        "Does this draft satisfy every requirement in the query?\n\n"
+        "Query: {input}\nDraft: {context}\n\n"
+        "If yes: output the draft unchanged.\n"
+        "If no: output a corrected version that satisfies all requirements:"
+    ),
+    # 5 — Constraint-first
+    (
+        "Before revising, list all constraints from the query.\n\n"
+        "Query:\n{input}\n\nDraft:\n{context}\n\n"
+        "Constraints identified:\n"
+        "Revised response (satisfies all constraints above):"
+    ),
+    # 6 — Direct imperative
+    (
+        "Rewrite the draft to meet all constraints in the query.\n\n"
+        "Query: {input}\nDraft: {context}\n\nRevised response:"
+    ),
+    # 7 — Acceptance-test framing
+    (
+        "Acceptance test: does the draft meet every requirement?\n\n"
+        "Requirements (from query): {input}\n\nCandidate response:\n{context}\n\n"
+        "Final requirement-compliant response:"
+    ),
+]
+
 # Mapping from state_id → template bank (used by initialisation and strategy mutation)
+# Includes both the legacy 4-state banks (start/decompose/verify) and the new
+# 2-state banks (draft/rewrite) so evolution works with either seed architecture.
 _TEMPLATE_BANKS: Dict[str, List[str]] = {
     "start":     _START_BANK,
     "decompose": _DECOMPOSE_BANK,
     "verify":    _VERIFY_BANK,
+    "draft":     _DRAFT_BANK,
+    "rewrite":   _REWRITE_BANK,
 }
 
 
