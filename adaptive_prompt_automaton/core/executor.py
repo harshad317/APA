@@ -99,7 +99,10 @@ class AutomatonExecutor:
         feature_extractor:     FeatureExtractor,
         n_consistency_samples: int = 1,
     ):
-        self.automaton              = automaton
+        # Evolution mutates Automaton.config directly. Refresh runtime wrappers
+        # before execution so fitness is measured on the candidate that will
+        # actually be returned/evaluated.
+        self.automaton              = automaton.refresh_runtime()
         self.llm                    = llm_api
         self.extractor              = feature_extractor
         self.n_consistency_samples  = max(1, n_consistency_samples)

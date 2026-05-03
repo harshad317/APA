@@ -47,11 +47,13 @@ from __future__ import annotations
 import argparse
 import os
 import random
+import json
+import re
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from threading import Lock
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -415,6 +417,8 @@ def _apa_train_tasks_from_ifbench(
 def _make_ifbench_episode_reward(
     scorer: IFBenchOfficialScorer,
     examples: List[IFBenchOfficialExample],
+    judge_score_fn: Optional[Callable[[str, str], float]] = None,
+    unsupported_fallback: str = "proxy",
 ) -> Callable[[Episode], float]:
     """
     Reward APA training with a blend of the official IFBench verifier and a
@@ -470,20 +474,131 @@ def _make_ifbench_episode_reward(
 
     def reward(episode: Episode) -> float:
         ex = by_prompt.get(episode.task_input)
-        if ex is None or not scorer.supports(ex):
-            return composite_reward(episode)
+        proxy = max(0.0, composite_reward(episode))
+        response = episode.final_output or ""
+        if ex is None:
+            if judge_score_fn is not None:
+                return min(1.0, 0.85 * judge_score_fn(episode.task_input, response)
+                              + 0.15 * proxy)
+            if unsupported_fallback == "zero":
+                return 0.0
+            return proxy
+        if not scorer.supports(ex):
+            if judge_score_fn is not None:
+                return min(1.0, 0.85 * judge_score_fn(ex.to_apa_task_input(), response)
+                              + 0.15 * proxy)
+            if unsupported_fallback == "zero":
+                return 0.0
+            return proxy
 
-        response     = episode.final_output or ""
         passed       = scorer.per_instruction(ex, response)
         instr_score  = sum(passed) / len(passed) if passed else 0.0
         prompt_score = 1.0 if passed and all(passed) else 0.0
-        proxy        = max(0.0, composite_reward(episode))
 
         return min(1.0, 0.35 * prompt_score
                       + 0.60 * instr_score
                       + 0.05 * proxy)
 
     return reward
+
+
+def _extract_json_object(text: str) -> Dict[str, object]:
+    """Best-effort JSON object extraction for LLM judge responses."""
+    raw = (text or "").strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
+        raw = re.sub(r"\s*```$", "", raw)
+    try:
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        pass
+
+    match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+    if match:
+        try:
+            parsed = json.loads(match.group(0))
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _coerce_score(value: object) -> Optional[float]:
+    """Coerce numeric/string judge scores to [0, 1]."""
+    if isinstance(value, bool):
+        return 1.0 if value else 0.0
+    if isinstance(value, (int, float)):
+        return max(0.0, min(1.0, float(value)))
+    if isinstance(value, str):
+        text = value.strip().rstrip("%")
+        try:
+            score = float(text)
+            if score > 1.0:
+                score /= 100.0
+            return max(0.0, min(1.0, score))
+        except Exception:
+            return None
+    return None
+
+
+def _make_llm_judge_score_fn(llm: object) -> Callable[[str, str], float]:
+    """
+    Build a benchmark-agnostic strict instruction-following judge.
+
+    This is used only when a benchmark's deterministic verifier cannot score a
+    training example. It gives APA a real constraint-alignment signal instead of
+    the old generic answer-quality proxy, while still working for any benchmark
+    that can express a task and candidate response as text.
+    """
+    cache: Dict[Tuple[str, str], float] = {}
+    lock = Lock()
+
+    def judge(task_input: str, response: str) -> float:
+        response = response or ""
+        if not response.strip():
+            return 0.0
+        key = (task_input, response)
+        with lock:
+            if key in cache:
+                return cache[key]
+
+        prompt = (
+            "You are a strict evaluator for an instruction-following benchmark.\n"
+            "Score only the candidate response. Do not solve the task yourself.\n\n"
+            "Task / user request:\n"
+            f"{task_input}\n\n"
+            "Candidate response:\n"
+            f"{response}\n\n"
+            "Evaluate every explicit requirement in the task, including format, "
+            "exact counts, required/forbidden words, ordering, language, length, "
+            "punctuation, and requested content. Penalize extra commentary, "
+            "analysis, labels, or checklist text unless the task asks for them.\n\n"
+            "Return JSON only with this schema:\n"
+            "{\"score\": <number from 0 to 1>, \"failed\": [\"short reason\", ...]}\n"
+            "Use score=1 only when all explicit requirements are satisfied; "
+            "use 0 when the response is empty, off-task, or violates most "
+            "hard constraints."
+        )
+        try:
+            raw, _tokens = llm.call(prompt, role="user", max_tokens=180)
+            data = _extract_json_object(raw)
+            score = _coerce_score(data.get("score"))
+            if score is None:
+                # Last-resort parse for models that emit plain text like
+                # "Score: 0.75" despite the JSON-only instruction.
+                match = re.search(r"(?:score|rating)\D+([01](?:\.\d+)?|\d{1,3}%)", raw, re.I)
+                score = _coerce_score(match.group(1)) if match else None
+            if score is None:
+                score = 0.0
+        except Exception:
+            score = 0.0
+
+        with lock:
+            cache[key] = score
+        return score
+
+    return judge
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -717,15 +832,33 @@ def run_apa(
     extractor  = FeatureExtractor()
     reward_examples = train_examples + val_examples
     n_supported_reward = sum(1 for ex in reward_examples if scorer.supports(ex))
+    reward_mode = getattr(args, "apa_reward_mode", "auto")
+    use_judge_reward = (
+        reward_mode == "judge"
+        or (
+            reward_mode == "auto"
+            and getattr(args, "model", "mock") != "mock"
+            and n_supported_reward < len(reward_examples)
+        )
+    )
+    judge_score_fn = _make_llm_judge_score_fn(llm_apa) if use_judge_reward else None
+    unsupported_fallback = "zero" if reward_mode == "verifier" else "proxy"
     reward_fn = (
-        _make_ifbench_episode_reward(scorer, reward_examples)
+        _make_ifbench_episode_reward(
+            scorer,
+            reward_examples,
+            judge_score_fn=judge_score_fn,
+            unsupported_fallback=unsupported_fallback,
+        )
         if reward_examples else composite_reward
     )
     if n_supported_reward:
         reward_label = (
             f"official verifier for {n_supported_reward} supported examples; "
-            "proxy fallback otherwise"
+            f"{'LLM judge' if judge_score_fn else 'proxy'} fallback otherwise"
         )
+    elif judge_score_fn:
+        reward_label = "LLM judge fallback for unsupported verifier examples"
     else:
         reward_label = "composite proxy"
     console.print(f"  [dim]APA reward:[/dim] {reward_label}")
@@ -977,6 +1110,7 @@ def main(args: argparse.Namespace) -> None:
         f"  APA val tasks : [green]{getattr(args, 'apa_val_tasks', 12)}[/green] "
         f"(top_k={getattr(args, 'apa_val_top_k', 2)}, "
         f"interval={getattr(args, 'apa_val_interval', 3)})\n"
+        f"  APA reward    : [green]{getattr(args, 'apa_reward_mode', 'auto')}[/green]\n"
         f"  DSPy cache: [green]disabled[/green] for GEPA/MIPRO\n"
         f"  Train    : [green]{train_size}[/green]  Val: [green]{val_size}[/green]  "
         f"Test: [green]300[/green] (official IFBench)",
@@ -1042,10 +1176,19 @@ def main(args: argparse.Namespace) -> None:
                     f"val={supported_val}[/dim]"
                 )
             else:
+                apa_reward_mode = getattr(args, "apa_reward_mode", "auto")
+                apa_signal = (
+                    "APA will use an LLM judge fallback; "
+                    if "apa" in methods and apa_reward_mode in ("auto", "judge")
+                    else "APA will use the selected fallback reward; "
+                    if "apa" in methods
+                    else ""
+                )
                 console.print(
                     "  [yellow]⚠ IF-RLVR train/val constraints are not covered by "
-                    "the vendored IFBench test verifier; optimizers will use "
-                    "general proxy/feedback signals for training and official "
+                    "the vendored IFBench test verifier; "
+                    f"{apa_signal}"
+                    "official "
                     "verification only on the test set.[/yellow]"
                 )
         except Exception as exc:
@@ -1217,6 +1360,20 @@ Sequential execution
     p.add_argument(
         "--apa-val-interval", dest="apa_val_interval", type=int, default=3,
         help="Run APA held-out validation reranking every N generations (default: 3).",
+    )
+    p.add_argument(
+        "--apa-reward-mode",
+        dest="apa_reward_mode",
+        choices=["auto", "verifier", "judge", "proxy"],
+        default="auto",
+        help=(
+            "APA training reward fallback. auto uses deterministic verifier when "
+            "available and an LLM judge for unsupported live-model train examples; "
+            "verifier gives unsupported examples zero reward; "
+            "judge always enables judge fallback; "
+            "proxy uses only the generic composite proxy for unsupported examples "
+            "(default: auto)."
+        ),
     )
     p.add_argument(
         "--gepa-auto", dest="gepa_auto", default="light",

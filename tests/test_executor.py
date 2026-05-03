@@ -23,6 +23,19 @@ from adaptive_prompt_automaton.core.features import FeatureExtractor
 from adaptive_prompt_automaton.utils.api import MockLLM
 
 
+class RecordingLLM:
+    """Small test LLM that records prompts and returns deterministic text."""
+
+    def __init__(self):
+        self.prompts = []
+        self.call_count = 0
+
+    def call(self, prompt: str, role: str = "user", max_tokens: int = 256):
+        self.prompts.append(prompt)
+        self.call_count += 1
+        return f"response {self.call_count}", len(prompt.split()) + 1
+
+
 # ── Shared fixtures ────────────────────────────────────────────────────────────
 
 @pytest.fixture
@@ -137,6 +150,51 @@ class TestBasicRoundTrip:
         ex.run_episode("q2")
         assert aut.episodes_run == 2
         assert sum(aut.path_counts.values()) == 2
+
+    def test_config_template_mutation_is_used_immediately(self, extractor):
+        aut = _build_two_state()
+        aut.config.states["start"].template = "MUTATED TEMPLATE: {input}"
+        llm = RecordingLLM()
+
+        ex = AutomatonExecutor(aut, llm, extractor)
+        ex.run_episode("question")
+
+        assert llm.prompts[0] == "MUTATED TEMPLATE: question"
+
+    def test_config_topology_mutation_is_used_immediately(self, extractor):
+        aut = _build_no_transition()
+        aut.config.states["repair"] = StateConfig(
+            state_id="repair",
+            name="Repair",
+            template="REPAIR: {context}",
+            is_terminal=False,
+            carry_context=True,
+        )
+        aut.config.transitions.append(
+            TransitionConfig(
+                source_state="start",
+                target_state="repair",
+                guard_type="always",
+                operator="always",
+                priority=10,
+            )
+        )
+        aut.config.transitions.append(
+            TransitionConfig(
+                source_state="repair",
+                target_state="terminal",
+                guard_type="always",
+                operator="always",
+                priority=1,
+            )
+        )
+        llm = RecordingLLM()
+
+        ex = AutomatonExecutor(aut, llm, extractor)
+        ep = ex.run_episode("question")
+
+        assert "repair" in ep.path
+        assert any(prompt.startswith("REPAIR:") for prompt in llm.prompts)
 
 
 class TestTermination:

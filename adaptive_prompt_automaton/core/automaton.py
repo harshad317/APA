@@ -77,12 +77,15 @@ class State:
     # ------------------------------------------------------------------
     def render(self, task_input: str, context: str = "") -> str:
         """Fill the prompt template with runtime values."""
+        # Read from the mutable config so evolutionary template edits are
+        # reflected immediately, even before the automaton is copied.
+        template = self.config.template
         try:
-            return self.template.format(input=task_input, context=context)
+            return template.format(input=task_input, context=context)
         except (KeyError, IndexError):
             # Fallback: plain replacement
             return (
-                self.template
+                template
                 .replace("{input}", task_input)
                 .replace("{context}", context)
             )
@@ -164,6 +167,26 @@ class Automaton:
         # Diversity selection scratch space (set by _diversity_aware_select).
         self._diversity_bonus:    float = 0.0
         self._augmented_fitness:  float = 0.0
+
+    # ------------------------------------------------------------------
+    def refresh_runtime(self) -> "Automaton":
+        """
+        Rebuild runtime State/Transition wrappers from the mutable config.
+
+        Evolutionary operators edit ``self.config`` directly: template swaps,
+        threshold changes, transition rewires, and topology additions all live
+        there first.  The executor reads runtime ``State`` and ``Transition``
+        wrappers, so those wrappers must stay in sync with config before an
+        episode is scored.  Keeping this as an explicit refresh preserves all
+        diagnostics while making config the single source of truth.
+        """
+        self.states = {
+            sid: State(sc) for sid, sc in self.config.states.items()
+        }
+        self.transitions = [
+            Transition(tc) for tc in self.config.transitions
+        ]
+        return self
 
     # ------------------------------------------------------------------
     def get_transitions_from(self, state_id: str) -> List[Transition]:
