@@ -311,9 +311,16 @@ def _build_stratified_probe_set(
             if ex.key not in seen_keys and len(selected) < n:
                 selected.append(ex)
                 seen_keys.add(ex.key)
-                if len(selected) - sum(1 for e in selected if
-                        (e.instruction_id_list[0].split(":")[0]
-                         if e.instruction_id_list else "x") == cat) >= per_cat:
+                # Count items already selected FROM this category (not from others).
+                # Previous code computed len(selected) - count_in_cat, which is the
+                # number of items from OTHER categories — always broke too early,
+                # leaving the first category to fill all probe slots.
+                count_in_cat = sum(
+                    1 for e in selected
+                    if (e.instruction_id_list[0].split(":")[0]
+                        if e.instruction_id_list else "x") == cat
+                )
+                if count_in_cat >= per_cat:
                     break
 
     # Fill remainder if categories ran short
@@ -739,6 +746,11 @@ def run_apa(
         llm_api              = llm_apa,
         feature_extractor    = extractor,
         reward_fn            = reward_fn,
+        # population_size=16: with elite_frac=0.25 this yields 4 elite survivors.
+        # The previous default of 8 gave only 2 elite slots, making diversity_quota=1
+        # almost meaningless (only 2 clusters could ever be covered).  4 elite slots
+        # let the quota protect up to 4 behaviorally distinct strategies simultaneously.
+        population_size      = 16,
         n_generations        = getattr(args, "apa_generations", 12),
         mutation_rate        = 0.40,
         elite_frac           = 0.25,

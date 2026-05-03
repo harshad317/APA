@@ -131,6 +131,7 @@ class AutomatonExecutor:
 
         current_state_id = self.automaton.start_state
         context          = ""
+        last_response    = ""
         budget_used      = 0
         max_budget       = self.automaton.config.max_budget
         max_steps        = self.automaton.config.max_steps
@@ -150,6 +151,34 @@ class AutomatonExecutor:
 
             episode.path.append(current_state_id)
 
+            # ── Short-circuit: downstream terminal state needs no LLM call ─
+            # Terminal states usually exist solely to pass the previous state's
+            # output through as final_output. Calling the LLM here
+            # wastes one API call per episode (25 % of the 4-state budget)
+            # and risks the model mutating the verified answer when invoked
+            # with role="assistant".  We use `context` directly instead.
+            #
+            # If the start state itself is terminal, there is no previous answer
+            # to pass through, so we fall through to the normal LLM call path.
+            if state.is_terminal and step_idx > 0:
+                response  = context or last_response
+                exec_step = ExecutionStep(
+                    step             = step_idx,
+                    state_id         = current_state_id,
+                    state_name       = state.name,
+                    prompt           = state.render(task_input, context),
+                    response         = response,
+                    features         = {},
+                    transition_taken = "TERMINAL",
+                    tokens_used      = 0,
+                )
+                episode.final_output     = response
+                episode.terminated_by    = "terminal_state"
+                episode.steps.append(exec_step)
+                if verbose:
+                    print(f"  [step {step_idx}] {state.name} → TERMINAL (no LLM call)")
+                break
+
             # ── Render prompt ─────────────────────────────────────────
             prompt = state.render(task_input, context)
 
@@ -157,6 +186,7 @@ class AutomatonExecutor:
             response, tokens = self.llm.call(
                 prompt, role=state.role, max_tokens=state.config.max_tokens
             )
+            last_response        = response
             budget_used          += 1
             episode.total_tokens += tokens
 
@@ -201,10 +231,13 @@ class AutomatonExecutor:
             if state.config.carry_context:
                 context = response
 
-            # ── Check terminal ────────────────────────────────────────
+            # ── Check terminal after LLM call ─────────────────────────
+            # This path is primarily for automata whose start state is itself
+            # terminal. Downstream terminal states are handled by the no-call
+            # pass-through branch above.
             if state.is_terminal:
-                episode.final_output     = response
-                episode.terminated_by    = "terminal_state"
+                episode.final_output       = response
+                episode.terminated_by      = "terminal_state"
                 exec_step.transition_taken = "TERMINAL"
                 episode.steps.append(exec_step)
                 if verbose:

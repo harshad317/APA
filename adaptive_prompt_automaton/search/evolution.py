@@ -420,6 +420,13 @@ def mutate_topology(automaton: Automaton, rng: random.Random = random) -> Automa
 
     if op == "add_bypass":
         # Add a direct high-confidence start→terminal edge if one doesn't exist.
+        # Priority must be HIGHER than any always-transition leaving start so the
+        # bypass guard is evaluated first and can actually fire.  The seed's
+        # start→decompose always-transition has priority=2, so we use priority=10.
+        # We also convert the start→decompose always-guard to a low-confidence
+        # threshold (answer_confidence < threshold) so the two edges compete:
+        #   - high confidence  → bypass directly to terminal (priority 10)
+        #   - lower confidence → decompose path (priority 2, threshold guard)
         start = child.config.start_state
         any_terminal = next(iter(terminal_ids), None)
         if any_terminal:
@@ -429,6 +436,19 @@ def mutate_topology(automaton: Automaton, rng: random.Random = random) -> Automa
                 for t in child.config.transitions
             )
             if not already:
+                bypass_threshold = rng.uniform(0.80, 0.95)
+                # Downgrade any start→decompose always-transitions to threshold
+                # guards so the bypass can compete with them.
+                for t in child.config.transitions:
+                    if (t.source_state == start
+                            and t.guard_type == "always"
+                            and t.target_state not in terminal_ids):
+                        t.guard_type    = "threshold"
+                        t.feature_name  = "answer_confidence"
+                        t.operator      = "<"
+                        t.threshold     = bypass_threshold
+                        t.priority      = max(t.priority, 2)
+                # Add bypass with a priority that beats the downgraded always-edge
                 child.config.transitions.append(TransitionConfig(
                     transition_id = _uuid.uuid4().hex[:8],
                     source_state  = start,
@@ -436,8 +456,8 @@ def mutate_topology(automaton: Automaton, rng: random.Random = random) -> Automa
                     guard_type    = "threshold",
                     feature_name  = "answer_confidence",
                     operator      = ">=",
-                    threshold     = rng.uniform(0.80, 0.95),
-                    priority      = 0,   # lowest — only fires when nothing else does
+                    threshold     = bypass_threshold,
+                    priority      = 10,  # evaluated before the decompose edge
                 ))
 
     elif op == "add_recheck":
