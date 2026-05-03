@@ -287,51 +287,64 @@ _REWRITE_BANK: List[str] = [
     # 0 — Direct constraint-adherent revision (output only)
     (
         "Revise the draft response so it satisfies EVERY constraint in the query. "
-        "Output ONLY the revised response — no analysis, no commentary.\n\n"
+        "Silently verify exact counts, required words, forbidden words, format, "
+        "length, ordering, punctuation, and language before finalizing. "
+        "Output ONLY the revised response between FINAL_RESPONSE_START and "
+        "FINAL_RESPONSE_END — no analysis, no commentary.\n\n"
         "Query:\n{input}\n\nDraft:\n{context}\n\nRevised response:"
     ),
     # 1 — Ensure correctness + constraints, output only
     (
         "Ensure the response is correct and fully adheres to every constraint "
-        "stated in the query. Output ONLY the final response.\n\n"
+        "stated in the query. Silently check each hard requirement before "
+        "finalizing. Output ONLY the final response between "
+        "FINAL_RESPONSE_START and FINAL_RESPONSE_END.\n\n"
         "Query:\n{input}\n\nDraft:\n{context}\n\nFinal response:"
     ),
     # 2 — Minimal conditional: pass or fix, output only
     (
         "If the draft already satisfies every requirement in the query, output it unchanged. "
-        "Otherwise, output a corrected version. Output ONLY the response text — nothing else.\n\n"
+        "Otherwise, output a corrected version. First silently check every explicit "
+        "requirement. Output ONLY the response text between FINAL_RESPONSE_START "
+        "and FINAL_RESPONSE_END — nothing else.\n\n"
         "Query: {input}\nDraft: {context}\n\nResponse:"
     ),
     # 3 — Expert revision, clean output
     (
         "You are an expert editor. Revise the draft so it precisely meets every "
-        "requirement stated in the query. Do not include any explanation — "
-        "output ONLY the final revised response.\n\n"
+        "requirement stated in the query. Silently verify all exact counts and "
+        "format rules. Do not include any explanation — output ONLY the final "
+        "revised response between FINAL_RESPONSE_START and FINAL_RESPONSE_END.\n\n"
         "Query:\n{input}\n\nDraft:\n{context}\n\nRevised response:"
     ),
     # 4 — Constraint-focused rewrite, output only
     (
         "Rewrite the draft to strictly comply with all constraints in the query. "
         "Pay careful attention to format, length, keywords, and any other stated requirements. "
-        "Output ONLY the rewritten response.\n\n"
+        "Silently verify the result, then output ONLY the rewritten response between "
+        "FINAL_RESPONSE_START and FINAL_RESPONSE_END.\n\n"
         "Query:\n{input}\n\nDraft:\n{context}\n\nRewritten response:"
     ),
     # 5 — Quality revision, output only
     (
         "Improve the draft so that it fully satisfies every constraint stated in the query. "
-        "Your output must be ONLY the final response — no preamble, no analysis.\n\n"
+        "Silently check the final text against every requirement. Your output must be "
+        "ONLY the final response between FINAL_RESPONSE_START and FINAL_RESPONSE_END — "
+        "no preamble, no analysis.\n\n"
         "Query: {input}\nDraft: {context}\n\nFinal response:"
     ),
     # 6 — Terse imperative, output only
     (
-        "Rewrite to meet all constraints. Output ONLY the response.\n\n"
+        "Rewrite to meet all constraints. Silently verify every hard requirement. "
+        "Output ONLY the response between FINAL_RESPONSE_START and FINAL_RESPONSE_END.\n\n"
         "Query: {input}\nDraft: {context}\n\nResponse:"
     ),
     # 7 — Compliance-focused, output only
     (
         "The query contains specific requirements about format, content, and style. "
         "Revise the draft until every single requirement is satisfied. "
-        "Output ONLY the compliant response — no commentary.\n\n"
+        "Silently verify exact counts and formatting. Output ONLY the compliant "
+        "response between FINAL_RESPONSE_START and FINAL_RESPONSE_END — no commentary.\n\n"
         "Query:\n{input}\n\nDraft:\n{context}\n\nCompliant response:"
     ),
 ]
@@ -373,10 +386,9 @@ _WORD_SWAPS: List[tuple] = [
 _INSTRUCTION_ADDONS: List[str] = [
     " Be concise.",
     " Be thorough.",
-    " Think carefully.",
-    " Verify your answer.",
+    " Silently verify every explicit requirement before finalizing.",
     " Be precise.",
-    " Reason step by step.",
+    " Output only the final answer.",
     " Avoid speculation.",
 ]
 
@@ -591,7 +603,10 @@ def mutate_topology(automaton: Automaton, rng: random.Random = random) -> Automa
             # Build a clean recheck template (output-only — no analysis text)
             recheck_template = (
                 "Make one final pass to ensure the response satisfies every constraint "
-                "in the query. Output ONLY the final response — no commentary.\n\n"
+                "in the query. Silently verify exact counts, required words, forbidden "
+                "words, format, length, ordering, punctuation, and language. Output "
+                "ONLY the final response between FINAL_RESPONSE_START and "
+                "FINAL_RESPONSE_END — no commentary.\n\n"
                 "Query: {input}\nDraft: {context}\n\nFinal response:"
             )
 

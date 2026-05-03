@@ -18,7 +18,11 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from adaptive_prompt_automaton.core.automaton import (
     Automaton, AutomatonConfig, StateConfig, TransitionConfig,
 )
-from adaptive_prompt_automaton.core.executor import AutomatonExecutor, Episode
+from adaptive_prompt_automaton.core.executor import (
+    AutomatonExecutor,
+    Episode,
+    clean_final_output,
+)
 from adaptive_prompt_automaton.core.features import FeatureExtractor
 from adaptive_prompt_automaton.utils.api import MockLLM
 
@@ -195,6 +199,61 @@ class TestBasicRoundTrip:
 
         assert "repair" in ep.path
         assert any(prompt.startswith("REPAIR:") for prompt in llm.prompts)
+
+
+class TestFinalOutputCleaning:
+    def test_strips_final_response_markers(self):
+        raw = "FINAL_RESPONSE_START\nThe actual answer.\nFINAL_RESPONSE_END"
+        assert clean_final_output(raw) == "The actual answer."
+
+    def test_strips_optimizer_prefix(self):
+        assert clean_final_output("Final response: The actual answer.") == "The actual answer."
+
+    def test_strips_full_markdown_fence(self):
+        raw = "```text\nThe actual answer.\n```"
+        assert clean_final_output(raw) == "The actual answer."
+
+    def test_terminal_output_is_cleaned(self, extractor):
+        states = {
+            "start": StateConfig(
+                state_id="start",
+                name="Start",
+                template="q: {input}",
+                is_terminal=False,
+                carry_context=True,
+            ),
+            "terminal": StateConfig(
+                state_id="terminal",
+                name="Terminal",
+                template="{context}",
+                is_terminal=True,
+                carry_context=False,
+            ),
+        }
+        transitions = [
+            TransitionConfig(
+                source_state="start",
+                target_state="terminal",
+                guard_type="always",
+                operator="always",
+            )
+        ]
+        aut = Automaton(AutomatonConfig(
+            name="cleaner",
+            start_state="start",
+            states=states,
+            transitions=transitions,
+        ))
+
+        class MarkedLLM(RecordingLLM):
+            def call(self, prompt: str, role: str = "user", max_tokens: int = 256):
+                self.prompts.append(prompt)
+                self.call_count += 1
+                return "FINAL_RESPONSE_START\nThe actual answer.\nFINAL_RESPONSE_END", 5
+
+        ep = AutomatonExecutor(aut, MarkedLLM(), extractor).run_episode("question")
+
+        assert ep.final_output == "The actual answer."
 
 
 class TestTermination:

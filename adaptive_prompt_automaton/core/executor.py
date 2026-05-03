@@ -25,6 +25,62 @@ from .features import FeatureExtractor, FeatureVector
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Final answer normalisation
+# ──────────────────────────────────────────────────────────────────────────────
+
+_FINAL_PREFIXES = (
+    "final response",
+    "revised response",
+    "rewritten response",
+    "compliant response",
+    "final answer",
+)
+
+
+def clean_final_output(text: str) -> str:
+    """
+    Remove optimizer scaffolding from the answer surface.
+
+    Prompt optimizers often ask models to produce "Final response:" or to wrap
+    the final answer between delimiters. Those markers help generation but hurt
+    downstream benchmark scorers that evaluate the literal final string. This
+    normalizer strips only wrapper text introduced by the optimizer, leaving the
+    task-requested content intact.
+    """
+    out = (text or "").strip()
+    if not out:
+        return ""
+
+    # Strip a full-response Markdown fence while preserving fenced code inside a
+    # larger answer.
+    if out.startswith("```") and out.endswith("```"):
+        lines = out.splitlines()
+        if len(lines) >= 3:
+            out = "\n".join(lines[1:-1]).strip()
+
+    marker_pairs = (
+        ("FINAL_RESPONSE_START", "FINAL_RESPONSE_END"),
+        ("<final_response>", "</final_response>"),
+        ("<final>", "</final>"),
+    )
+    for start, end in marker_pairs:
+        start_idx = out.find(start)
+        end_idx = out.find(end)
+        if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+            out = out[start_idx + len(start):end_idx].strip()
+            break
+
+    lower = out.lower()
+    for prefix in _FINAL_PREFIXES:
+        label = prefix + ":"
+        if lower.startswith(label):
+            out = out[len(label):].strip()
+            break
+
+    return out
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Data containers
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -164,7 +220,7 @@ class AutomatonExecutor:
             # If the start state itself is terminal, there is no previous answer
             # to pass through, so we fall through to the normal LLM call path.
             if state.is_terminal and step_idx > 0:
-                response  = context or last_response
+                response  = clean_final_output(context or last_response)
                 exec_step = ExecutionStep(
                     step             = step_idx,
                     state_id         = current_state_id,
@@ -239,7 +295,7 @@ class AutomatonExecutor:
             # terminal. Downstream terminal states are handled by the no-call
             # pass-through branch above.
             if state.is_terminal:
-                episode.final_output       = response
+                episode.final_output       = clean_final_output(response)
                 episode.terminated_by      = "terminal_state"
                 exec_step.transition_taken = "TERMINAL"
                 episode.steps.append(exec_step)
@@ -270,14 +326,14 @@ class AutomatonExecutor:
             if next_state_id is None:
                 episode.terminated_by = "no_transition"
                 if not episode.final_output:
-                    episode.final_output = response
+                    episode.final_output = clean_final_output(response)
                 break
 
             current_state_id = next_state_id
 
         # ── Ensure final_output is populated ─────────────────────────
         if not episode.final_output and episode.steps:
-            episode.final_output = episode.steps[-1].response
+            episode.final_output = clean_final_output(episode.steps[-1].response)
 
         # ── Record path in automaton ──────────────────────────────────
         self.automaton.record_path(episode.path)

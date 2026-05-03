@@ -239,8 +239,11 @@ def build_apa_seed() -> Automaton:
                 "constraint stated in the original query.\n\n"
                 "Original query:\n{input}\n\n"
                 "Draft response:\n{context}\n\n"
-                "Check each constraint explicitly, then output the final "
-                "constraint-compliant response:"
+                "Silently check every explicit requirement: exact counts, "
+                "required words, forbidden words, format, length, ordering, "
+                "punctuation, language, and requested content. Output ONLY the "
+                "final constraint-compliant response between "
+                "FINAL_RESPONSE_START and FINAL_RESPONSE_END:"
             ),
             role="user", max_tokens=512, is_terminal=False, carry_context=True,
         ),
@@ -542,6 +545,19 @@ def _coerce_score(value: object) -> Optional[float]:
     return None
 
 
+def _coerce_bool(value: object) -> Optional[bool]:
+    """Coerce judge booleans emitted as bools or strings."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"true", "yes", "y", "1", "pass", "passed"}:
+            return True
+        if text in {"false", "no", "n", "0", "fail", "failed"}:
+            return False
+    return None
+
+
 def _make_llm_judge_score_fn(llm: object) -> Callable[[str, str], float]:
     """
     Build a benchmark-agnostic strict instruction-following judge.
@@ -575,15 +591,22 @@ def _make_llm_judge_score_fn(llm: object) -> Callable[[str, str], float]:
             "punctuation, and requested content. Penalize extra commentary, "
             "analysis, labels, or checklist text unless the task asks for them.\n\n"
             "Return JSON only with this schema:\n"
-            "{\"score\": <number from 0 to 1>, \"failed\": [\"short reason\", ...]}\n"
-            "Use score=1 only when all explicit requirements are satisfied; "
-            "use 0 when the response is empty, off-task, or violates most "
-            "hard constraints."
+            "{\"all_requirements_satisfied\": <true|false>, "
+            "\"score\": <number from 0 to 1>, \"failed\": [\"short reason\", ...]}\n"
+            "Set all_requirements_satisfied=true only when every explicit hard "
+            "requirement is satisfied. Use score=1 only in that case. For any "
+            "missing exact count, format rule, required word, forbidden word, "
+            "or length requirement, all_requirements_satisfied must be false. "
+            "Use 0 when the response is empty, off-task, or violates most hard "
+            "constraints."
         )
         try:
             raw, _tokens = llm.call(prompt, role="user", max_tokens=180)
             data = _extract_json_object(raw)
             score = _coerce_score(data.get("score"))
+            all_ok = _coerce_bool(data.get("all_requirements_satisfied"))
+            if all_ok is None:
+                all_ok = _coerce_bool(data.get("passed"))
             if score is None:
                 # Last-resort parse for models that emit plain text like
                 # "Score: 0.75" despite the JSON-only instruction.
@@ -591,6 +614,8 @@ def _make_llm_judge_score_fn(llm: object) -> Callable[[str, str], float]:
                 score = _coerce_score(match.group(1)) if match else None
             if score is None:
                 score = 0.0
+            if all_ok is False:
+                score = min(score, 0.65 * score)
         except Exception:
             score = 0.0
 
@@ -867,7 +892,7 @@ def run_apa(
     # Probe set is selected once here and held constant for the entire run.
     # Size = apa_eval_tasks so API cost is identical to the previous random-
     # sample approach — fingerprinting is free (Fix 5).
-    apa_eval_tasks_n = min(getattr(args, "apa_eval_tasks", 5), len(apa_tasks))
+    apa_eval_tasks_n = min(getattr(args, "apa_eval_tasks", 20), len(apa_tasks))
     probe_pool = train_examples if train_examples else []
     probe_examples: List[IFBenchOfficialExample] = []
     fp_fn = None
@@ -890,7 +915,7 @@ def run_apa(
     # automaton is selected by held-out validation performance. This prevents a
     # tiny probe set from choosing prompts that win by sampling luck and carries
     # over to every benchmark that can supply validation tasks + reward_fn.
-    apa_val_tasks_n = min(getattr(args, "apa_val_tasks", 12), len(val_examples))
+    apa_val_tasks_n = min(getattr(args, "apa_val_tasks", 24), len(val_examples))
     val_probe_examples: List[IFBenchOfficialExample] = []
     if val_examples and apa_val_tasks_n > 0:
         val_probe_examples = _build_stratified_probe_set(
@@ -951,8 +976,8 @@ def run_apa(
         # out-of-sample performance.
         validation_tasks     = validation_task_inputs,
         validation_reward_fn = reward_fn,
-        validation_top_k     = getattr(args, "apa_val_top_k", 2),
-        validation_interval  = getattr(args, "apa_val_interval", 3),
+        validation_top_k     = getattr(args, "apa_val_top_k", 4),
+        validation_interval  = getattr(args, "apa_val_interval", 2),
         # Parallelism — now active during training (was only in eval before)
         workers              = getattr(args, "workers", 1),
         # Early stopping — stop when best fitness does not improve by more than
@@ -1085,7 +1110,7 @@ def main(args: argparse.Namespace) -> None:
     train_size = getattr(args, "train_size", 300)
     val_size   = getattr(args, "val_size", 100)
     workers    = getattr(args, "workers", 4)
-    apa_eval_tasks = getattr(args, "apa_eval_tasks", 5)
+    apa_eval_tasks = getattr(args, "apa_eval_tasks", 20)
     methods    = [m.lower() for m in args.methods]
 
     # ── Banner ─────────────────────────────────────────────────────────────
@@ -1107,9 +1132,9 @@ def main(args: argparse.Namespace) -> None:
         f"  Methods  : [green]{', '.join(methods)}[/green]\n"
         f"  Workers  : [green]{workers}[/green] (parallel LLM calls per eval pass)\n"
         f"  APA eval tasks: [green]{apa_eval_tasks}[/green] per fitness evaluation\n"
-        f"  APA val tasks : [green]{getattr(args, 'apa_val_tasks', 12)}[/green] "
-        f"(top_k={getattr(args, 'apa_val_top_k', 2)}, "
-        f"interval={getattr(args, 'apa_val_interval', 3)})\n"
+        f"  APA val tasks : [green]{getattr(args, 'apa_val_tasks', 24)}[/green] "
+        f"(top_k={getattr(args, 'apa_val_top_k', 4)}, "
+        f"interval={getattr(args, 'apa_val_interval', 2)})\n"
         f"  APA reward    : [green]{getattr(args, 'apa_reward_mode', 'auto')}[/green]\n"
         f"  DSPy cache: [green]disabled[/green] for GEPA/MIPRO\n"
         f"  Train    : [green]{train_size}[/green]  Val: [green]{val_size}[/green]  "
@@ -1275,7 +1300,7 @@ Examples
   python ifbench_eval.py --model gpt-4.1-mini --apa-eval-tasks 20
 
   # Rerank APA candidates on more held-out validation tasks
-  python ifbench_eval.py --model gpt-4.1-mini --apa-val-tasks 30
+  python ifbench_eval.py --model gpt-4.1-mini --apa-val-tasks 40
 
   # Pass API key inline
   python ifbench_eval.py --model gpt-4.1-mini --api-key sk-...
@@ -1344,22 +1369,22 @@ Sequential execution
         ),
     )
     p.add_argument(
-        "--apa-val-tasks", dest="apa_val_tasks", type=int, default=12,
+        "--apa-val-tasks", dest="apa_val_tasks", type=int, default=24,
         help=(
             "Held-out validation prompts used to rerank APA candidates during "
-            "search (default: 12). Set 0 to disable validation reranking."
+            "search (default: 24). Set 0 to disable validation reranking."
         ),
     )
     p.add_argument(
-        "--apa-val-top-k", dest="apa_val_top_k", type=int, default=2,
+        "--apa-val-top-k", dest="apa_val_top_k", type=int, default=4,
         help=(
             "Number of top APA candidates to score on held-out validation at "
-            "each rerank point (default: 2)."
+            "each rerank point (default: 4)."
         ),
     )
     p.add_argument(
-        "--apa-val-interval", dest="apa_val_interval", type=int, default=3,
-        help="Run APA held-out validation reranking every N generations (default: 3).",
+        "--apa-val-interval", dest="apa_val_interval", type=int, default=2,
+        help="Run APA held-out validation reranking every N generations (default: 2).",
     )
     p.add_argument(
         "--apa-reward-mode",
