@@ -40,6 +40,7 @@ from __future__ import annotations
 import json
 import sys
 import random
+import ast
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -81,6 +82,22 @@ class IFBenchOfficialExample:
         """Return constraint_text if set, otherwise generate from instruction IDs."""
         if self.constraint_text:
             return self.constraint_text
+        _ensure_ifbench_on_path()
+        try:
+            import instructions_registry as _ir  # type: ignore[import]
+
+            parts = []
+            for inst_id, kw in zip(self.instruction_id_list, self.kwargs):
+                checker_cls = _ir.INSTRUCTION_DICT.get(inst_id)
+                if checker_cls is None:
+                    raise KeyError(inst_id)
+                clean_kw = {k: v for k, v in kw.items() if v is not None}
+                checker = checker_cls(inst_id)
+                parts.append(str(checker.build_description(**clean_kw)))
+            if parts:
+                return " | ".join(parts)
+        except Exception:
+            pass
         parts = []
         for inst_id, kw in zip(self.instruction_id_list, self.kwargs):
             clean_kw = {k: v for k, v in kw.items() if v is not None}
@@ -113,10 +130,20 @@ class IFBenchOfficialExample:
         if not self.instruction_id_list:
             return self.prompt
 
-        lines: List[str] = []
-        for inst_id, kw in zip(self.instruction_id_list, self.kwargs):
-            clean_kw = {k: v for k, v in kw.items() if v is not None}
-            lines.append(f"  • {inst_id}: {json.dumps(clean_kw)}")
+        constraint_text = self.get_constraint_text()
+        raw_lines = [
+            part.strip()
+            for chunk in constraint_text.split("\t")
+            for part in chunk.split(" | ")
+            if part.strip()
+        ]
+        if raw_lines:
+            lines = [f"  • {line}" for line in raw_lines]
+        else:
+            lines = []
+            for inst_id, kw in zip(self.instruction_id_list, self.kwargs):
+                clean_kw = {k: v for k, v in kw.items() if v is not None}
+                lines.append(f"  • {inst_id}: {json.dumps(clean_kw)}")
 
         constraint_block = (
             "\n\n---\n"
@@ -182,24 +209,41 @@ class IFBenchOfficialScorer:
             kwargs              = self._clean_kwargs(example.kwargs),
         )
 
+    def supports(self, example: IFBenchOfficialExample) -> bool:
+        """Return True if the vendored IFBench scorer can verify this example."""
+        try:
+            import instructions_registry as _ir  # type: ignore[import]
+            return bool(example.instruction_id_list) and all(
+                inst_id in _ir.INSTRUCTION_DICT
+                for inst_id in example.instruction_id_list
+            )
+        except Exception:
+            return False
+
     # ------------------------------------------------------------------
     # Public scoring methods
     # ------------------------------------------------------------------
 
     def prompt_loose(self, example: IFBenchOfficialExample, response: str) -> float:
         """1.0 if response satisfies ALL constraints (loose), else 0.0."""
+        if not self.supports(example):
+            return 0.0
         inp = self._make_input(example)
         out = self._el.test_instruction_following_loose(inp, {example.prompt: response})
         return 1.0 if out.follow_all_instructions else 0.0
 
     def prompt_strict(self, example: IFBenchOfficialExample, response: str) -> float:
         """1.0 if response satisfies ALL constraints (strict), else 0.0."""
+        if not self.supports(example):
+            return 0.0
         inp = self._make_input(example)
         out = self._el.test_instruction_following_strict(inp, {example.prompt: response})
         return 1.0 if out.follow_all_instructions else 0.0
 
     def instruction_loose(self, example: IFBenchOfficialExample, response: str) -> float:
         """Fraction of individual constraints satisfied (loose)."""
+        if not self.supports(example):
+            return 0.0
         inp = self._make_input(example)
         out = self._el.test_instruction_following_loose(inp, {example.prompt: response})
         n   = len(out.follow_instruction_list)
@@ -209,6 +253,8 @@ class IFBenchOfficialScorer:
         self, example: IFBenchOfficialExample, response: str
     ) -> List[bool]:
         """Per-constraint pass/fail list (loose mode)."""
+        if not self.supports(example):
+            return [False] * len(example.instruction_id_list)
         inp = self._make_input(example)
         out = self._el.test_instruction_following_loose(inp, {example.prompt: response})
         return list(out.follow_instruction_list)
@@ -218,6 +264,14 @@ class IFBenchOfficialScorer:
         Natural-language feedback string for GEPA's reflection step.
         Describes which constraints failed and why the prompt should be revised.
         """
+        if not self.supports(example):
+            return (
+                "The local IFBench verifier does not support this training "
+                "example's constraint IDs. Prefer general instruction-following "
+                "changes: explicitly identify every stated requirement in the "
+                "prompt, satisfy them in the final answer, and avoid extra "
+                "commentary unless requested."
+            )
         inp  = self._make_input(example)
         out  = self._el.test_instruction_following_loose(inp, {example.prompt: response})
         passed = sum(out.follow_instruction_list)
@@ -265,29 +319,99 @@ class IFBenchOfficialScorer:
 # Data loaders
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _parse_serialized(value: Any, default: Any) -> Any:
+    """Parse JSON or Python-literal strings used by different HF schemas."""
+    if value is None:
+        return default
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    if not text:
+        return default
+    try:
+        return json.loads(text)
+    except Exception:
+        try:
+            return ast.literal_eval(text)
+        except Exception:
+            return default
+
+
+def _extract_prompt(row: Dict[str, Any]) -> str:
+    """Extract the user prompt across official JSONL and HF chat schemas."""
+    if row.get("prompt"):
+        return str(row["prompt"])
+    messages = row.get("messages")
+    if isinstance(messages, str):
+        messages = _parse_serialized(messages, [])
+    if isinstance(messages, list):
+        for message in messages:
+            if isinstance(message, dict) and message.get("role") == "user":
+                return str(message.get("content", ""))
+        for message in messages:
+            if isinstance(message, dict) and message.get("content"):
+                return str(message.get("content", ""))
+    return str(row.get("input", ""))
+
+
+def _extract_ground_truth(row: Dict[str, Any]) -> Tuple[List[str], List[Dict[str, Any]]]:
+    """
+    Extract instruction IDs and kwargs across official IFBench and IF-RLVR schemas.
+
+    The IF-RLVR HuggingFace pool stores verifier metadata under `ground_truth`,
+    e.g. "[{'instruction_id': [...], 'kwargs': [...]}]".
+    """
+    inst_ids = row.get("instruction_id_list", row.get("instruction_id", []))
+    kw_list = row.get("kwargs", row.get("kwarg", []))
+
+    if inst_ids or kw_list:
+        inst_ids = _parse_serialized(inst_ids, [])
+        kw_list = _parse_serialized(kw_list, [])
+    else:
+        gt = _parse_serialized(row.get("ground_truth"), [])
+        if isinstance(gt, dict):
+            gt = [gt]
+        inst_ids = []
+        kw_list = []
+        if isinstance(gt, list):
+            for item in gt:
+                if not isinstance(item, dict):
+                    continue
+                ids = item.get("instruction_id_list", item.get("instruction_id", []))
+                kws = item.get("kwargs", item.get("kwarg", []))
+                ids = _parse_serialized(ids, [])
+                kws = _parse_serialized(kws, [])
+                if isinstance(ids, str):
+                    ids = [ids]
+                if not isinstance(kws, list):
+                    kws = [kws]
+                inst_ids.extend(list(ids))
+                kw_list.extend(kws)
+
+    if isinstance(inst_ids, str):
+        inst_ids = [inst_ids]
+    if not isinstance(kw_list, list):
+        kw_list = [kw_list]
+    kw_list = [dict(kw) if isinstance(kw, dict) else {} for kw in kw_list]
+    while len(kw_list) < len(inst_ids):
+        kw_list.append({})
+
+    return list(inst_ids), kw_list[: len(inst_ids)]
+
+
 def _row_to_example(row: Dict[str, Any], fallback_key: int) -> IFBenchOfficialExample:
     """Convert a HuggingFace / JSONL row to IFBenchOfficialExample."""
     # Handle both int and str keys
     key = str(row.get("key", fallback_key))
 
-    # instruction_id_list may be a list or a JSON-encoded string
-    inst_ids = row.get("instruction_id_list", [])
-    if isinstance(inst_ids, str):
-        inst_ids = json.loads(inst_ids)
-
-    # kwargs may be a list of dicts or a JSON-encoded string
-    kw_list = row.get("kwargs", [])
-    if isinstance(kw_list, str):
-        kw_list = json.loads(kw_list)
-    # Normalise: ensure each entry is a dict
-    kw_list = [dict(kw) if kw is not None else {} for kw in kw_list]
+    inst_ids, kw_list = _extract_ground_truth(row)
 
     return IFBenchOfficialExample(
         key                 = key,
-        prompt              = str(row.get("prompt", "")),
+        prompt              = _extract_prompt(row),
         instruction_id_list = list(inst_ids),
         kwargs              = kw_list,
-        constraint_text     = row.get("constraint_text") or None,
+        constraint_text     = row.get("constraint_text") or row.get("constraint") or None,
     )
 
 

@@ -6,8 +6,8 @@ Evaluate APA, GEPA, and MIPRO on the official IFBench benchmark.
 
 Each method works as it does in its respective paper:
 
-  APA   — 4-state FSA trained via evolutionary search (composite_reward).
-           Unchanged from the APA paper.
+  APA   — finite-state prompt policy trained via evolutionary search, with
+           held-out validation reranking when train/val data is available.
 
   GEPA  — Official dspy.GEPA with the IFBench two-stage rewriter pipeline:
              Stage 1 (fixed)  : "Respond to the query" → draft_answer
@@ -180,7 +180,7 @@ def _make_proxy_fingerprint_fn() -> Callable[[str, str], float]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# APA seed automaton (4-state FSA, unchanged)
+# APA seed automaton
 # ══════════════════════════════════════════════════════════════════════════════
 
 def build_apa_seed() -> Automaton:
@@ -376,11 +376,14 @@ def _make_fingerprint_fn(
     prompt_to_example: Dict[str, IFBenchOfficialExample] = {
         ex.to_apa_task_input(): ex for ex in probe_examples
     }
+    proxy_fingerprint = _make_proxy_fingerprint_fn()
 
     def fingerprint_fn(task_input: str, response: str) -> float:
         ex = prompt_to_example.get(task_input)
         if ex is None:
-            return 0.0
+            return proxy_fingerprint(task_input, response)
+        if not scorer.supports(ex):
+            return proxy_fingerprint(task_input, response)
         return scorer.instruction_loose(ex, response)
 
     return fingerprint_fn
@@ -389,11 +392,13 @@ def _make_fingerprint_fn(
 def _apa_train_tasks_from_ifbench(
     examples: List[IFBenchOfficialExample],
 ) -> List[Task]:
-    """Wrap IFBench examples as APA Task objects for evolutionary training.
+    """
+    Wrap IFBench examples as APA Task objects for evolutionary training.
 
-    Uses to_apa_task_input() which augments the raw prompt with a structured
-    constraint checklist — giving APA the same explicit constraint inventory
-    that GEPA passes as a separate field to its stage-2 rewriter.
+    Use the same structured task input that APA receives at evaluation time.
+    Training on raw prompts but evaluating on prompt+constraint metadata creates
+    an objective mismatch and makes mutations look better or worse for the wrong
+    reason.
     """
     return [
         Task(
@@ -407,27 +412,13 @@ def _apa_train_tasks_from_ifbench(
     ]
 
 
-# Phrases that indicate the model engaged in explicit constraint-satisfaction reasoning.
-# Updated for the 2-state draft→rewrite architecture.  The rewrite state asks the
-# model to "check each constraint explicitly" — these markers appear when it does so.
-# They are lexical, path-independent quality signals: a model that explicitly names
-# and checks constraints in its rewrite is more likely to satisfy them.
-_REASONING_MARKERS: tuple = (
-    "constraint", "requirement", "must ",
-    "verified", "satisf", "comply", "complian",
-    "each constraint", "all constraints",
-    "check", "adhere", "ensur", "revise",
-    "draft", "revis",
-)
-
-
 def _make_ifbench_episode_reward(
     scorer: IFBenchOfficialScorer,
     examples: List[IFBenchOfficialExample],
 ) -> Callable[[Episode], float]:
     """
-    Reward APA training with a blend of the official IFBench verifier, a
-    composite proxy, and a reasoning-quality bonus.
+    Reward APA training with a blend of the official IFBench verifier and a
+    small benchmark-agnostic output-quality proxy.
 
     Blending rationale
     ──────────────────
@@ -438,10 +429,9 @@ def _make_ifbench_episode_reward(
 
     Three complementary signals are blended:
 
-      0.20 × prompt_score      — binary: all constraints fully satisfied (rare on IF-RLVR)
-      0.55 × instr_score       — PRIMARY: fraction of individual constraints passed
-      0.15 × composite_reward  — smooth baseline: word count, punctuation, no hedging
-      0.10 × reasoning_bonus   — structured constraint-analysis language present
+      0.35 × prompt_score      — binary: all constraints fully satisfied
+      0.60 × instr_score       — PRIMARY: fraction of individual constraints passed
+      0.05 × composite_reward  — smooth tie-breaker for well-formed outputs
 
     Weight rationale (re-calibrated after observing actual run behaviour):
     ─────────────────────────────────────────────────────────────────────
@@ -465,21 +455,22 @@ def _make_ifbench_episode_reward(
     for all templates that produce substantive responses — it contributes a fixed
     offset to fitness but no between-template discriminating signal.
 
-    reasoning_bonus is raised to 0.10 (from 0.08) to slightly reward templates
-    that elicit explicit constraint-analysis reasoning.
+    Earlier versions rewarded visible "constraint analysis" language in the
+    final response. That leaks optimizer scaffolding into the answer and is not
+    general: many benchmarks score only the final answer surface. The current
+    reward keeps all verifier signal in the official scorer and uses the proxy
+    only as a small tie-breaker.
 
     Example fitness values (with n=20 probe tasks, official verifier):
-      Terse response (fails all):                     ≈ 0.00 + 0.03 + 0.08 + 0.00 = 0.11
-      Structured, fails all (0/5 constraints):        ≈ 0.00 + 0.03 + 0.13 + 0.10 = 0.26
-      Partial pass (2/5 constraints, structured):     ≈ 0.00 + 0.22 + 0.13 + 0.10 = 0.45
-      Good pass (4/5 constraints, structured):        ≈ 0.00 + 0.44 + 0.13 + 0.10 = 0.67
-      Full pass (all constraints):                    ≈ 0.20 + 0.55 + 0.13 + 0.10 = 0.98
+      Partial pass (2/5 constraints):                 ≈ 0.00 + 0.24 + 0.04 = 0.28
+      Good pass (4/5 constraints):                    ≈ 0.00 + 0.48 + 0.04 = 0.52
+      Full pass (all constraints):                    ≈ 0.35 + 0.60 + 0.04 = 0.99
     """
     by_prompt = {ex.to_apa_task_input(): ex for ex in examples}
 
     def reward(episode: Episode) -> float:
         ex = by_prompt.get(episode.task_input)
-        if ex is None:
+        if ex is None or not scorer.supports(ex):
             return composite_reward(episode)
 
         response     = episode.final_output or ""
@@ -488,16 +479,9 @@ def _make_ifbench_episode_reward(
         prompt_score = 1.0 if passed and all(passed) else 0.0
         proxy        = max(0.0, composite_reward(episode))
 
-        # Reasoning bonus: reward explicit constraint-analysis language.
-        # 0.08 weight is small enough to never override verifier signal yet
-        # large enough to meaningfully separate structured from terse responses.
-        lower            = response.lower()
-        reasoning_bonus  = 0.10 if any(m in lower for m in _REASONING_MARKERS) else 0.0
-
-        return min(1.0, 0.20 * prompt_score
-                      + 0.55 * instr_score
-                      + 0.15 * proxy
-                      + reasoning_bonus)
+        return min(1.0, 0.35 * prompt_score
+                      + 0.60 * instr_score
+                      + 0.05 * proxy)
 
     return reward
 
@@ -711,6 +695,7 @@ def run_apa(
     args,
     llm_apa,
     train_examples: List[IFBenchOfficialExample],
+    val_examples:   List[IFBenchOfficialExample],
     test_examples:  List[IFBenchOfficialExample],
     scorer:         IFBenchOfficialScorer,
 ) -> Dict[str, float]:
@@ -730,11 +715,19 @@ def run_apa(
         ]
 
     extractor  = FeatureExtractor()
+    reward_examples = train_examples + val_examples
+    n_supported_reward = sum(1 for ex in reward_examples if scorer.supports(ex))
     reward_fn = (
-        _make_ifbench_episode_reward(scorer, train_examples)
-        if train_examples else composite_reward
+        _make_ifbench_episode_reward(scorer, reward_examples)
+        if reward_examples else composite_reward
     )
-    reward_label = "official IFBench verifier" if train_examples else "composite proxy"
+    if n_supported_reward:
+        reward_label = (
+            f"official verifier for {n_supported_reward} supported examples; "
+            "proxy fallback otherwise"
+        )
+    else:
+        reward_label = "composite proxy"
     console.print(f"  [dim]APA reward:[/dim] {reward_label}")
 
     # ── Build fixed stratified probe set (Fixes 2 & 4) ───────────────────
@@ -758,6 +751,26 @@ def run_apa(
         )
 
     probe_task_inputs = [ex.to_apa_task_input() for ex in probe_examples] if probe_examples else None
+
+    # ── Held-out validation reranking (benchmark-agnostic search feature) ──
+    # Evolution still explores using the train probe set, but the returned
+    # automaton is selected by held-out validation performance. This prevents a
+    # tiny probe set from choosing prompts that win by sampling luck and carries
+    # over to every benchmark that can supply validation tasks + reward_fn.
+    apa_val_tasks_n = min(getattr(args, "apa_val_tasks", 12), len(val_examples))
+    val_probe_examples: List[IFBenchOfficialExample] = []
+    if val_examples and apa_val_tasks_n > 0:
+        val_probe_examples = _build_stratified_probe_set(
+            val_examples,
+            n    = apa_val_tasks_n,
+            seed = SEED + 1,
+        )
+        console.print(
+            f"  [dim]Validation rerank: {len(val_probe_examples)} stratified held-out tasks[/dim]"
+        )
+    validation_task_inputs = [
+        ex.to_apa_task_input() for ex in val_probe_examples
+    ] if val_probe_examples else None
 
     # ── Fallback fingerprinting when no HuggingFace train data ───────────────
     # When datasets is not installed, probe_pool is empty → probe_examples is
@@ -800,6 +813,13 @@ def run_apa(
         diversity_lambda     = 0.10,
         diversity_threshold  = 0.15,
         diversity_quota      = 1,
+        # Held-out reranking is generic, not IFBench-specific: any caller can
+        # supply validation tasks and a reward function to select for
+        # out-of-sample performance.
+        validation_tasks     = validation_task_inputs,
+        validation_reward_fn = reward_fn,
+        validation_top_k     = getattr(args, "apa_val_top_k", 2),
+        validation_interval  = getattr(args, "apa_val_interval", 3),
         # Parallelism — now active during training (was only in eval before)
         workers              = getattr(args, "workers", 1),
         # Early stopping — stop when best fitness does not improve by more than
@@ -947,13 +967,16 @@ def main(args: argparse.Namespace) -> None:
         "[bold bright_white]IFBench Official Evaluation[/bold bright_white]\n\n"
         "[dim]Each method works exactly as in its respective paper.\n"
         "Methods run sequentially — each finishes train + eval before the next starts.[/dim]\n\n"
-        "  [cyan bold]APA[/cyan bold]    — 4-state FSA, evolutionary search (unchanged)\n"
+        "  [cyan bold]APA[/cyan bold]    — FSA evolutionary search + held-out reranking\n"
         f"  [yellow bold]GEPA[/yellow bold]   — IFBench 2-stage rewriter  [{_gepa_tag}]\n"
         f"  [magenta bold]MIPRO[/magenta bold]  — IFBench 2-stage rewriter  [{_mipro_tag}]\n\n"
         f"  Model    : {_model_tag}\n"
         f"  Methods  : [green]{', '.join(methods)}[/green]\n"
         f"  Workers  : [green]{workers}[/green] (parallel LLM calls per eval pass)\n"
         f"  APA eval tasks: [green]{apa_eval_tasks}[/green] per fitness evaluation\n"
+        f"  APA val tasks : [green]{getattr(args, 'apa_val_tasks', 12)}[/green] "
+        f"(top_k={getattr(args, 'apa_val_top_k', 2)}, "
+        f"interval={getattr(args, 'apa_val_interval', 3)})\n"
         f"  DSPy cache: [green]disabled[/green] for GEPA/MIPRO\n"
         f"  Train    : [green]{train_size}[/green]  Val: [green]{val_size}[/green]  "
         f"Test: [green]300[/green] (official IFBench)",
@@ -998,7 +1021,7 @@ def main(args: argparse.Namespace) -> None:
     train_examples: List[IFBenchOfficialExample] = []
     val_examples:   List[IFBenchOfficialExample] = []
 
-    need_hf = ("gepa" in methods or "mipro" in methods) and model != "mock"
+    need_hf = any(m in methods for m in ("apa", "gepa", "mipro")) and model != "mock"
     if need_hf:
         console.print(f"  [dim]Loading IF-RLVR train/val from HuggingFace …[/dim]")
         try:
@@ -1011,9 +1034,25 @@ def main(args: argparse.Namespace) -> None:
                 f"  ✓ train: [green]{len(train_examples)}[/green]  "
                 f"val: [green]{len(val_examples)}[/green]"
             )
+            supported_train = sum(1 for ex in train_examples if scorer.supports(ex))
+            supported_val = sum(1 for ex in val_examples if scorer.supports(ex))
+            if supported_train or supported_val:
+                console.print(
+                    f"  [dim]local verifier support: train={supported_train}, "
+                    f"val={supported_val}[/dim]"
+                )
+            else:
+                console.print(
+                    "  [yellow]⚠ IF-RLVR train/val constraints are not covered by "
+                    "the vendored IFBench test verifier; optimizers will use "
+                    "general proxy/feedback signals for training and official "
+                    "verification only on the test set.[/yellow]"
+                )
         except Exception as exc:
             console.print(f"  [yellow]⚠ HuggingFace load failed:[/yellow] {exc}")
-            console.print("  [dim]GEPA and MIPRO will be skipped.[/dim]")
+            console.print(
+                "  [dim]GEPA and MIPRO will be skipped; APA will use fallback proxy training.[/dim]"
+            )
             methods = [m for m in methods if m == "apa"]
     elif ("gepa" in methods or "mipro" in methods) and model == "mock":
         console.print(
@@ -1034,7 +1073,7 @@ def main(args: argparse.Namespace) -> None:
 
         if method == "apa":
             results["APA"] = run_apa(
-                args, llm_apa, train_examples, test_examples, scorer
+                args, llm_apa, train_examples, val_examples, test_examples, scorer
             )
 
         elif method == "gepa":
@@ -1091,6 +1130,9 @@ Examples
 
   # Give APA a less noisy IFBench training signal
   python ifbench_eval.py --model gpt-4.1-mini --apa-eval-tasks 20
+
+  # Rerank APA candidates on more held-out validation tasks
+  python ifbench_eval.py --model gpt-4.1-mini --apa-val-tasks 30
 
   # Pass API key inline
   python ifbench_eval.py --model gpt-4.1-mini --api-key sk-...
@@ -1157,6 +1199,24 @@ Sequential execution
             "Number of evolutionary generations for APA training (default: 12). "
             "More generations allow the search to escape local optima found early."
         ),
+    )
+    p.add_argument(
+        "--apa-val-tasks", dest="apa_val_tasks", type=int, default=12,
+        help=(
+            "Held-out validation prompts used to rerank APA candidates during "
+            "search (default: 12). Set 0 to disable validation reranking."
+        ),
+    )
+    p.add_argument(
+        "--apa-val-top-k", dest="apa_val_top_k", type=int, default=2,
+        help=(
+            "Number of top APA candidates to score on held-out validation at "
+            "each rerank point (default: 2)."
+        ),
+    )
+    p.add_argument(
+        "--apa-val-interval", dest="apa_val_interval", type=int, default=3,
+        help="Run APA held-out validation reranking every N generations (default: 3).",
     )
     p.add_argument(
         "--gepa-auto", dest="gepa_auto", default="light",

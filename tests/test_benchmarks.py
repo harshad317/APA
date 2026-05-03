@@ -5,8 +5,10 @@ Unit tests for composite_reward() boundary conditions and the
 path-independence of the revised reward function.
 """
 import pytest
+import json
 from adaptive_prompt_automaton.core.executor import Episode, ExecutionStep
 from adaptive_prompt_automaton.eval.benchmarks import composite_reward
+from adaptive_prompt_automaton.eval.ifbench_official import _row_to_example
 
 
 def make_episode(
@@ -149,3 +151,30 @@ class TestBoundaries:
         for output in ["", "a", "word " * 200, "I'm not sure possibly unclear uncertain"]:
             r = composite_reward(make_episode(output))
             assert -1.0 <= r <= 1.0, f"Out of range: {r} for output={output!r}"
+
+
+class TestIFBenchOfficialLoader:
+    def test_hf_if_rlvr_schema_extracts_prompt_and_constraints(self):
+        row = {
+            "key": "example",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Answer the math question. Use exactly two sentences.",
+                }
+            ],
+            "ground_truth": json.dumps([
+                {
+                    "instruction_id": ["length_constraints:number_sentences"],
+                    "kwargs": [{"num_sentences": 2}],
+                }
+            ]),
+            "constraint": "Use exactly two sentences.",
+        }
+
+        ex = _row_to_example(row, fallback_key=0)
+
+        assert ex.prompt == "Answer the math question. Use exactly two sentences."
+        assert ex.instruction_id_list == ["length_constraints:number_sentences"]
+        assert ex.kwargs == [{"num_sentences": 2}]
+        assert "Use exactly two sentences" in ex.to_apa_task_input()

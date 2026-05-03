@@ -180,6 +180,7 @@ class OpenAILLM:
         self,
         model:   str = "gpt-3.5-turbo",
         api_key: Optional[str] = None,
+        temperature: float = 0.0,
     ):
         try:
             import openai
@@ -189,6 +190,7 @@ class OpenAILLM:
             ) from exc
 
         self.model        = model
+        self.temperature  = temperature
         self.client       = openai.OpenAI(
             api_key=api_key or os.environ.get("OPENAI_API_KEY")
         )
@@ -209,6 +211,7 @@ class OpenAILLM:
             model      = self.model,
             messages   = [{"role": safe_role, "content": prompt}],
             max_tokens = max_tokens,
+            temperature = self.temperature,
         )
         text   = resp.choices[0].message.content or ""
         tokens = resp.usage.total_tokens
@@ -234,7 +237,7 @@ def get_llm_api(backend: str = "mock", **kwargs):
     Falls back to MockLLM automatically if OPENAI_API_KEY is absent.
     """
     if backend == "openai":
-        if os.environ.get("OPENAI_API_KEY"):
+        if kwargs.get("api_key") or os.environ.get("OPENAI_API_KEY"):
             return OpenAILLM(**kwargs)
         else:
             print("[api] OPENAI_API_KEY not set — falling back to MockLLM.")

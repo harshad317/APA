@@ -707,13 +707,13 @@ class EvolutionarySearch:
 
     Diversity / fingerprinting parameters
     ───────────────────────────────────────
-    probe_tasks          : Fixed probe task strings for fitness + fingerprinting
+    probe_tasks          : Fixed probe task strings for fitness evaluation
                            (Fix 2 & 4).  When provided, every evaluation uses
                            exactly these tasks — no random sampling, no refresh.
                            This gives a stable, low-variance fitness signal and
-                           produces comparable fingerprints across generations.
-                           If None, falls back to random sampling (backward
-                           compatible) with no fingerprinting.
+                           can also produce comparable fingerprints across
+                           generations when fingerprint_fn is provided. If None,
+                           falls back to random sampling.
     fingerprint_fn       : callable(task_input: str, response: str) → float ∈ [0,1]
                            Applied once per probe task to build the fingerprint
                            vector (Fix 5 — zero extra API calls: same episode).
@@ -724,6 +724,14 @@ class EvolutionarySearch:
                            within this distance share a cluster (Fix 3). Default 0.15.
     diversity_quota      : Minimum survivors per cluster (Fix 3, primary hard
                            constraint). Default 1.
+    validation_tasks     : Optional held-out task strings used only to rerank the
+                           best candidates. This is benchmark-agnostic protection
+                           against overfitting small probe sets.
+    validation_reward_fn : Reward function for validation episodes. Defaults to
+                           reward_fn when validation_tasks are supplied.
+    validation_top_k     : Number of top training-fitness candidates to score on
+                           validation at each validation interval. 0 disables.
+    validation_interval  : Validate every N generations.
     """
 
     def __init__(
@@ -745,6 +753,10 @@ class EvolutionarySearch:
         diversity_lambda:    float = 0.10,
         diversity_threshold: float = 0.15,
         diversity_quota:     int   = 1,
+        validation_tasks:    Optional[List[str]] = None,
+        validation_reward_fn: Optional[Callable[[Episode], float]] = None,
+        validation_top_k:    int   = 0,
+        validation_interval: int   = 1,
         # Parallelism — number of individuals evaluated concurrently during training.
         # Probe-task evaluation within a single individual remains sequential;
         # population-level parallelism is embarrassingly parallel (no shared state).
@@ -775,8 +787,18 @@ class EvolutionarySearch:
         self.diversity_lambda    = diversity_lambda
         self.diversity_threshold = diversity_threshold
         self.diversity_quota     = diversity_quota
-        # Fingerprinting active only when both probe_tasks and fingerprint_fn given
-        self._fingerprinting     = (probe_tasks is not None and fingerprint_fn is not None)
+        # Fixed probes are useful even without fingerprinting. Older code coupled
+        # these two concepts and silently ignored probe_tasks unless a
+        # fingerprint_fn was also supplied.
+        self._fixed_probe_eval   = probe_tasks is not None
+        self._fingerprinting     = (self._fixed_probe_eval and fingerprint_fn is not None)
+        # Optional held-out reranking. This is deliberately generic: callers can
+        # pass any benchmark's validation inputs and reward function.
+        self.validation_tasks     = validation_tasks or []
+        self.validation_reward_fn = validation_reward_fn or reward_fn
+        self.validation_top_k     = max(0, validation_top_k)
+        self.validation_interval  = max(1, validation_interval)
+        self._validation_active   = bool(self.validation_tasks and self.validation_top_k > 0)
         # Parallelism
         self.workers              = max(1, workers)
         # Early stopping
@@ -786,7 +808,11 @@ class EvolutionarySearch:
         # Diagnostics
         self.history:        List[Dict[str, Any]] = []
         self.best_automaton: Optional[Automaton]  = None
+        # best_fitness is the selection metric: validation fitness when held-out
+        # reranking is active, otherwise training fitness.
         self.best_fitness:   float                = -float("inf")
+        self.best_train_fitness:      float       = -float("inf")
+        self.best_validation_fitness: float       = -float("inf")
 
     # ──────────────────────────────────────────────────────────────────────────
     # Initialisation  (Fix 1 — diverse population from template bank)
@@ -866,7 +892,7 @@ class EvolutionarySearch:
         executor = AutomatonExecutor(automaton, self.llm, self.extractor)
 
         # Fixed probe set (Fixes 2 & 4), pre-computed sample, or inline random sample
-        if self._fingerprinting and self.probe_tasks:
+        if self._fixed_probe_eval and self.probe_tasks:
             sample = self.probe_tasks          # always the same fixed set
         elif _sample is not None:
             sample = _sample                   # pre-computed by caller (thread-safe)
@@ -911,8 +937,8 @@ class EvolutionarySearch:
         Thread-safety design:
           - Each individual has its own Automaton instance — no shared mutable state
             between threads at the individual level.
-          - When probe_tasks is set (fingerprinting mode): _evaluate() uses the
-            fixed probe_tasks list — self.rng is never called inside _evaluate(),
+          - When probe_tasks is set: _evaluate() uses the fixed probe_tasks list
+            — self.rng is never called inside _evaluate(),
             so there is no RNG race condition.
           - When probe_tasks is NOT set (random-sample fallback): all random samples
             are generated here in the main thread BEFORE dispatching to the pool,
@@ -929,7 +955,7 @@ class EvolutionarySearch:
 
         # Pre-compute random samples in main thread when not using fixed probe set
         # (keeps self.rng single-threaded — thread-safe)
-        if self._fingerprinting and self.probe_tasks:
+        if self._fixed_probe_eval and self.probe_tasks:
             samples: List[Optional[List[str]]] = [None] * len(individuals)
         else:
             samples = [
@@ -951,6 +977,94 @@ class EvolutionarySearch:
             )
             for fut in bar:
                 fut.result()   # re-raise any exception from worker
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Held-out validation scoring
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _score_on_tasks(
+        self,
+        automaton: Automaton,
+        tasks: List[str],
+        reward_fn: Callable[[Episode], float],
+    ) -> float:
+        """
+        Score an automaton on a fixed task list without overwriting training
+        fitness or fingerprints.
+
+        A copy is executed so validation reranking does not mutate the candidate's
+        path diagnostics. The LLM backend is shared intentionally, so API-call
+        accounting remains accurate.
+        """
+        eval_automaton = automaton.copy()
+        executor = AutomatonExecutor(eval_automaton, self.llm, self.extractor)
+        rewards: List[float] = []
+        for i, task in enumerate(tasks):
+            ep = executor.run_episode(task, episode_id=f"val_{i}")
+            rewards.append(reward_fn(ep))
+        return sum(rewards) / len(rewards) if rewards else 0.0
+
+    def _validation_rerank(
+        self,
+        population: List[Automaton],
+        generation: int,
+        console: Console,
+    ) -> Optional[bool]:
+        """
+        Evaluate top training-fitness candidates on held-out validation tasks and
+        track the best validation candidate seen so far.
+        """
+        if not self._validation_active:
+            return None
+        if generation % self.validation_interval != 0:
+            return None
+
+        candidates = sorted(population, key=lambda a: -a.fitness)[
+            : min(self.validation_top_k, len(population))
+        ]
+        if not candidates:
+            return None
+
+        def _score(candidate: Automaton) -> float:
+            return self._score_on_tasks(
+                candidate,
+                self.validation_tasks,
+                self.validation_reward_fn,
+            )
+
+        if self.workers <= 1 or len(candidates) <= 1:
+            scores = [_score(c) for c in candidates]
+        else:
+            scores = [0.0] * len(candidates)
+            with ThreadPoolExecutor(max_workers=min(self.workers, len(candidates))) as pool:
+                fut_to_idx = {
+                    pool.submit(_score, cand): i
+                    for i, cand in enumerate(candidates)
+                }
+                for fut in as_completed(fut_to_idx):
+                    scores[fut_to_idx[fut]] = fut.result()
+
+        best_idx = max(range(len(candidates)), key=lambda i: scores[i])
+        best_candidate = candidates[best_idx]
+        best_score = scores[best_idx]
+
+        for cand, score in zip(candidates, scores):
+            cand.validation_fitness = score
+
+        improved = best_score > self.best_validation_fitness + self.improvement_threshold
+        if improved:
+            self.best_validation_fitness = best_score
+            self.best_train_fitness = best_candidate.fitness
+            self.best_fitness = best_score
+            self.best_automaton = best_candidate.copy(copy_diagnostics=True)
+            self.best_automaton.validation_fitness = best_score
+
+        console.print(
+            f"[dim]Validation gen {generation}: "
+            f"best={best_score:.4f} "
+            f"(top_k={len(candidates)}, tasks={len(self.validation_tasks)})[/dim]"
+        )
+        return improved
 
     # ──────────────────────────────────────────────────────────────────────────
     # Tournament selection (unchanged)
@@ -1101,7 +1215,7 @@ class EvolutionarySearch:
         fp_status = (
             "[green]enabled[/green]"
             if self._fingerprinting
-            else "[yellow]disabled — pass probe_tasks + fingerprint_fn to activate[/yellow]"
+            else "[yellow]disabled — pass fingerprint_fn to activate[/yellow]"
         )
         # Fix 6 — architectural scope note surfaced in run banner
         arch_note = (
@@ -1124,6 +1238,9 @@ class EvolutionarySearch:
             f"  Training tasks       : [green]{len(train_tasks)}[/green]\n"
             f"  Workers (training)   : [green]{self.workers}[/green]\n"
             f"  Fingerprinting       : {fp_status}\n"
+            f"  Validation rerank    : "
+            f"{'[green]enabled[/green]' if self._validation_active else '[dim]disabled[/dim]'}"
+            f"{f'  top_k={self.validation_top_k}, tasks={len(self.validation_tasks)}' if self._validation_active else ''}\n"
             f"  Diversity λ (bonus)  : [green]{self.diversity_lambda}[/green]\n"
             f"  Cluster threshold    : [green]{self.diversity_threshold}[/green]\n"
             f"  Diversity quota      : [green]{self.diversity_quota}[/green]"
@@ -1137,6 +1254,7 @@ class EvolutionarySearch:
 
         console.print("[yellow]Evaluating initial population…[/yellow]")
         self._evaluate_batch(population, train_tasks, desc="Init Eval", colour="cyan")
+        self._validation_rerank(population, generation=0, console=console)
 
         # ── Generational loop ─────────────────────��────────────────────────
         gen_bar = tqdm(range(self.n_generations), desc="  Generations", colour="green")
@@ -1149,16 +1267,20 @@ class EvolutionarySearch:
             gen_mean  = sum(a.fitness for a in population) / len(population)
             gen_worst = population[-1].fitness
 
-            # Track global best + early-stopping streak counter
+            # Track global best + early-stopping streak counter.
+            # With validation active, patience is updated after validation
+            # reranking at the end of the generation.
             prev_best = self.best_fitness
-            if gen_best.fitness > self.best_fitness:
-                self.best_fitness   = gen_best.fitness
-                self.best_automaton = gen_best.copy(copy_diagnostics=True)
+            if not self._validation_active and gen_best.fitness > self.best_fitness:
+                self.best_fitness        = gen_best.fitness
+                self.best_train_fitness  = gen_best.fitness
+                self.best_automaton      = gen_best.copy(copy_diagnostics=True)
 
-            if self.best_fitness - prev_best > self.improvement_threshold:
-                no_improvement_streak = 0
-            else:
-                no_improvement_streak += 1
+            if not self._validation_active:
+                if self.best_fitness - prev_best > self.improvement_threshold:
+                    no_improvement_streak = 0
+                else:
+                    no_improvement_streak += 1
 
             self.history.append({
                 "generation":    gen,
@@ -1181,7 +1303,11 @@ class EvolutionarySearch:
                 self._print_gen_table(gen, population[:5], console)
 
             # ── Early stopping check ───────────────────────────────────────
-            if self.patience > 0 and no_improvement_streak >= self.patience:
+            if (
+                self.patience > 0
+                and not self._validation_active
+                and no_improvement_streak >= self.patience
+            ):
                 console.print(
                     f"[yellow]Early stopping at generation {gen}: "
                     f"no improvement > {self.improvement_threshold} "
@@ -1215,13 +1341,31 @@ class EvolutionarySearch:
             )
 
             population = new_pop
+            validation_improved = self._validation_rerank(
+                population, generation=gen + 1, console=console
+            )
+            if validation_improved is not None:
+                no_improvement_streak = 0 if validation_improved else no_improvement_streak + 1
+                if self.patience > 0 and no_improvement_streak >= self.patience:
+                    console.print(
+                        f"[yellow]Early stopping at generation {gen + 1}: "
+                        f"no validation improvement > {self.improvement_threshold} "
+                        f"for {self.patience} validation checks.[/yellow]"
+                    )
+                    break
 
         # ── Final summary ─────────────��─────────────────────────────��──────
         gens_run = len(self.history)
         console.print(Panel(
             f"[bold green]Training complete![/bold green]\n\n"
-            f"  Best fitness  : [cyan]{self.best_fitness:.4f}[/cyan]\n"
-            f"  Generations   : [cyan]{gens_run}[/cyan] / {self.n_generations}"
+            f"  Best fitness  : [cyan]{self.best_fitness:.4f}[/cyan]"
+            f"{'  [dim](validation)[/dim]' if self._validation_active else ''}\n"
+            f"  Best train    : [cyan]{self.best_train_fitness:.4f}[/cyan]\n"
+            + (
+                f"  Best val      : [cyan]{self.best_validation_fitness:.4f}[/cyan]\n"
+                if self._validation_active else ""
+            )
+            + f"  Generations   : [cyan]{gens_run}[/cyan] / {self.n_generations}"
             + (f"  [dim](early stopped)[/dim]" if gens_run < self.n_generations else "") +
             f"\n  Total LLM calls so far: [cyan]{self.llm.call_count}[/cyan]",
             title="[bold]Search Results[/bold]",
