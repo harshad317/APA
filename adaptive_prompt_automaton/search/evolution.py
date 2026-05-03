@@ -278,61 +278,61 @@ _DRAFT_BANK: List[str] = [
 ]
 
 _REWRITE_BANK: List[str] = [
-    # 0 — Constraint checklist + revise (matches seed)
+    # ── IMPORTANT: all templates must produce ONLY the final answer as output.
+    # Any template that asks for intermediate analysis (PASS/FAIL lists, constraint
+    # audits, numbered checks) causes the model to embed that analysis in the
+    # final_output string, which breaks IFBench format/word-count verifiers.
+    # Every template below ends with a directive to output ONLY the revised response.
+
+    # 0 — Direct constraint-adherent revision (output only)
     (
-        "Revise the draft response below so that it satisfies EVERY "
-        "constraint stated in the original query.\n\n"
-        "Original query:\n{input}\n\n"
-        "Draft response:\n{context}\n\n"
-        "Check each constraint explicitly, then output the final "
-        "constraint-compliant response:"
+        "Revise the draft response so it satisfies EVERY constraint in the query. "
+        "Output ONLY the revised response — no analysis, no commentary.\n\n"
+        "Query:\n{input}\n\nDraft:\n{context}\n\nRevised response:"
     ),
-    # 1 — PASS/FAIL audit framing
+    # 1 — Ensure correctness + constraints, output only
     (
-        "Audit the draft against every constraint in the query.\n\n"
-        "Query:\n{input}\n\nDraft:\n{context}\n\n"
-        "For each constraint: mark PASS or FAIL.\n"
-        "Rewrite the response so all constraints are PASS.\n"
-        "Final constraint-compliant response:"
+        "Ensure the response is correct and fully adheres to every constraint "
+        "stated in the query. Output ONLY the final response.\n\n"
+        "Query:\n{input}\n\nDraft:\n{context}\n\nFinal response:"
     ),
-    # 2 — Numbered constraint mapping
+    # 2 — Minimal conditional: pass or fix, output only
     (
-        "The query contains specific requirements. Satisfy every one of them.\n\n"
-        "Query:\n{input}\n\nDraft:\n{context}\n\n"
-        "1. List each requirement from the query.\n"
-        "2. Check whether the draft satisfies each.\n"
-        "3. Output the revised, fully compliant response:"
+        "If the draft already satisfies every requirement in the query, output it unchanged. "
+        "Otherwise, output a corrected version. Output ONLY the response text — nothing else.\n\n"
+        "Query: {input}\nDraft: {context}\n\nResponse:"
     ),
-    # 3 — Expert reviewer persona
+    # 3 — Expert revision, clean output
     (
-        "As an expert reviewer, verify this draft satisfies every stated constraint.\n\n"
-        "Original query:\n{input}\n\nDraft to review:\n{context}\n\n"
-        "Issues found (if any):\nFinal corrected response:"
+        "You are an expert editor. Revise the draft so it precisely meets every "
+        "requirement stated in the query. Do not include any explanation — "
+        "output ONLY the final revised response.\n\n"
+        "Query:\n{input}\n\nDraft:\n{context}\n\nRevised response:"
     ),
-    # 4 — Minimal conditional fix
+    # 4 — Constraint-focused rewrite, output only
     (
-        "Does this draft satisfy every requirement in the query?\n\n"
-        "Query: {input}\nDraft: {context}\n\n"
-        "If yes: output the draft unchanged.\n"
-        "If no: output a corrected version that satisfies all requirements:"
+        "Rewrite the draft to strictly comply with all constraints in the query. "
+        "Pay careful attention to format, length, keywords, and any other stated requirements. "
+        "Output ONLY the rewritten response.\n\n"
+        "Query:\n{input}\n\nDraft:\n{context}\n\nRewritten response:"
     ),
-    # 5 — Constraint-first
+    # 5 — Quality revision, output only
     (
-        "Before revising, list all constraints from the query.\n\n"
-        "Query:\n{input}\n\nDraft:\n{context}\n\n"
-        "Constraints identified:\n"
-        "Revised response (satisfies all constraints above):"
+        "Improve the draft so that it fully satisfies every constraint stated in the query. "
+        "Your output must be ONLY the final response — no preamble, no analysis.\n\n"
+        "Query: {input}\nDraft: {context}\n\nFinal response:"
     ),
-    # 6 — Direct imperative
+    # 6 — Terse imperative, output only
     (
-        "Rewrite the draft to meet all constraints in the query.\n\n"
-        "Query: {input}\nDraft: {context}\n\nRevised response:"
+        "Rewrite to meet all constraints. Output ONLY the response.\n\n"
+        "Query: {input}\nDraft: {context}\n\nResponse:"
     ),
-    # 7 — Acceptance-test framing
+    # 7 — Compliance-focused, output only
     (
-        "Acceptance test: does the draft meet every requirement?\n\n"
-        "Requirements (from query): {input}\n\nCandidate response:\n{context}\n\n"
-        "Final requirement-compliant response:"
+        "The query contains specific requirements about format, content, and style. "
+        "Revise the draft until every single requirement is satisfied. "
+        "Output ONLY the compliant response — no commentary.\n\n"
+        "Query:\n{input}\n\nDraft:\n{context}\n\nCompliant response:"
     ),
 ]
 
@@ -567,30 +567,51 @@ def mutate_topology(automaton: Automaton, rng: random.Random = random) -> Automa
                 ))
 
     elif op == "add_recheck":
-        # Clone the verify state as a "recheck" node and insert it before terminal.
-        if "verify" in child.config.states and terminal_ids:
-            recheck_id = f"recheck_{_uuid.uuid4().hex[:4]}"
-            verify_sc  = child.config.states["verify"]
+        # Clone the last revision state as a "recheck" node inserted before terminal.
+        # Supports both 4-state seeds (verify state) and 2-state seeds (rewrite state).
+        # Falls back to whichever non-terminal state has outgoing edges to terminal.
+        revision_state_id: Optional[str] = None
+        for candidate in ("verify", "rewrite"):
+            if candidate in child.config.states and candidate not in terminal_ids:
+                revision_state_id = candidate
+                break
+        if revision_state_id is None:
+            # Pick any non-terminal state that has a transition to terminal
+            for sid in non_terminal_ids:
+                if any(t.source_state == sid and t.target_state in terminal_ids
+                       for t in child.config.transitions):
+                    revision_state_id = sid
+                    break
+
+        if revision_state_id and terminal_ids:
+            recheck_id    = f"recheck_{_uuid.uuid4().hex[:4]}"
+            revision_sc   = child.config.states[revision_state_id]
+            any_terminal  = next(iter(terminal_ids))
+
+            # Build a clean recheck template (output-only — no analysis text)
+            recheck_template = (
+                "Make one final pass to ensure the response satisfies every constraint "
+                "in the query. Output ONLY the final response — no commentary.\n\n"
+                "Query: {input}\nDraft: {context}\n\nFinal response:"
+            )
+
             child.config.states[recheck_id] = StateConfig(
                 state_id      = recheck_id,
                 name          = "Recheck",
-                template      = verify_sc.template.replace("Verify", "Re-verify")
-                                if "Verify" in verify_sc.template
-                                else "Final check — task: {input}\nDraft: {context}\nOutput the corrected answer.",
-                role          = verify_sc.role,
-                max_tokens    = verify_sc.max_tokens,
+                template      = recheck_template,
+                role          = revision_sc.role,
+                max_tokens    = revision_sc.max_tokens,
                 is_terminal   = False,
                 carry_context = True,
             )
-            any_terminal = next(iter(terminal_ids))
-            # verify → recheck (always)
+            # revision_state → recheck (always, high priority)
             child.config.transitions.append(TransitionConfig(
                 transition_id = _uuid.uuid4().hex[:8],
-                source_state  = "verify",
+                source_state  = revision_state_id,
                 target_state  = recheck_id,
                 guard_type    = "always",
                 operator      = "always",
-                priority      = 10,   # fires before existing verify→terminal
+                priority      = 10,   # fires before existing revision→terminal edge
             ))
             # recheck → terminal (always)
             child.config.transitions.append(TransitionConfig(
@@ -601,10 +622,10 @@ def mutate_topology(automaton: Automaton, rng: random.Random = random) -> Automa
                 operator      = "always",
                 priority      = 1,
             ))
-            # Remove any old verify→terminal always transitions (they are now bypassed)
+            # Remove old revision_state→terminal always transitions (now superseded)
             child.config.transitions = [
                 t for t in child.config.transitions
-                if not (t.source_state == "verify"
+                if not (t.source_state == revision_state_id
                         and t.target_state in terminal_ids
                         and t.guard_type == "always"
                         and t.priority < 10)
@@ -784,7 +805,17 @@ class EvolutionarySearch:
         in the template bank (one strategy per individual per state), then use
         high-intensity mutation for any additional individuals.
         """
-        population = [self.template_automaton.copy()]   # Keep exact seed
+        # Seed individual: copy the provided automaton, then apply the bank's
+        # canonical index-0 template for each state that has a bank entry.
+        # This ensures the seed uses the same clean, output-only templates as
+        # the rest of the initial population — preventing any regression caused
+        # by verbose analysis templates in the caller-provided seed.
+        seed_clone = self.template_automaton.copy()
+        for sid in seed_clone.config.states:
+            bank = _TEMPLATE_BANKS.get(sid, [])
+            if bank:
+                seed_clone.config.states[sid].template = bank[0]
+        population = [seed_clone]
 
         bank_size = len(_START_BANK)   # 8 structurally distinct strategies
 
